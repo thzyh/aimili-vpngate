@@ -19,6 +19,12 @@ class NodePoolTests(unittest.TestCase):
             ["live"],
         )
 
+    def test_stale_active_flag_is_not_protected_without_runtime_active_id(self):
+        self.assertEqual(
+            protected_active_nodes([node("stale", "available", True)], ""),
+            [],
+        )
+
     def test_candidate_queue_prioritizes_existing_valid_and_excludes_ineligible_nodes(self):
         candidates = [node("fresh"), node("good"), node("cool"), node("tested")]
         queue = candidate_queue(

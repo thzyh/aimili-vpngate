@@ -1500,7 +1500,8 @@ def replenish_valid_pool(
     preferred_ids = {
         str(item.get("id") or "")
         for item in existing_nodes
-        if item.get("probe_status") == "available" and not item.get("active")
+        if item.get("probe_status") == "available"
+        and str(item.get("id") or "") not in protected_ids
     }
     tested_ids: set[str] = set()
     tested_count = 0

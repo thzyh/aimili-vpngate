@@ -14,9 +14,12 @@ def _node_id(node: Node) -> str:
 
 def protected_active_nodes(existing_nodes: list[Node], active_node_id: str) -> list[Node]:
     """返回补池期间必须保护的当前活动节点，最多一个。"""
+    active_node_id = str(active_node_id or "").strip()
+    if not active_node_id:
+        return []
     for node in existing_nodes:
         node_id = _node_id(node)
-        if node_id and (node_id == active_node_id or node.get("active")):
+        if node_id == active_node_id:
             return [node]
     return []
 
