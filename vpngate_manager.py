@@ -1339,67 +1339,23 @@ def tcp_prescreen_dead(nodes: list[dict[str, Any]]) -> dict[str, dict[str, Any]]
         list(executor.map(probe, tcp_nodes))
     return dead
 
-def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
-    with lock:
-        nodes = read_nodes()
-        to_test = [n for n in nodes if n.get("id") in node_ids]
-
-    # 分层测速：先用快速 TCP 粗筛淘汰明确死掉的 TCP 节点，避免为其空转完整 OpenVPN 握手
-    dead_prescreen = tcp_prescreen_dead(to_test)
-    if dead_prescreen:
-        print(f"[分层测速] TCP 预筛淘汰 {len(dead_prescreen)} 个不可达节点，剩余 {len(to_test) - len(dead_prescreen)} 个进入 OpenVPN 测试", flush=True)
-    to_test = [n for n in to_test if n.get("id") not in dead_prescreen]
-
-    def test_worker(args: tuple[int, dict[str, Any]]) -> dict[str, Any]:
-        idx, n_info = args
-        node_id = n_info["id"]
-        config_text = n_info.get("config_text") or ""
-        h = str(n_info.get("remote_host") or n_info.get("ip"))
-        p = parse_int(n_info.get("remote_port"))
-        fallback_ping = parse_int(n_info.get("ping"))
-        
-        temp_path = test_config_path(node_id)
-        try:
-            CONFIG_DIR.mkdir(exist_ok=True, parents=True)
-            temp_path.write_text(config_text, encoding="utf-8")
-        except Exception as e:
-            return {
-                "id": node_id,
-                "latency_ms": 0,
-                "probe_status": "unavailable",
-                "probe_message": f"Failed to write configuration: {e}",
-                "probed_at": time.time(),
-                "owner": "",
-                "asn": "",
-                "as_name": "",
-                "location": "",
-                "ip_type": "",
-                "quality": "",
-            }
-            
-        latency = vpn_utils.ping_latency_ms(h, p, fallback_ping)
-        tun_idx = None
-        try:
-            tun_idx = get_free_test_index()
-            dev_name = f"tun{tun_idx}"
-            ok, message, _ = run_openvpn_until_ready(str(temp_path), keep_alive=False, route_nopull=True, timeout=12, dev=dev_name)
-        finally:
-            if tun_idx is not None:
-                release_test_index(tun_idx)
-            try:
-                if temp_path.exists():
-                    temp_path.unlink()
-            except Exception:
-                pass
-            
-        temp_node = {
-            "id": node_id,
-            "ip": n_info.get("ip") or h,
-            "remote_host": h,
-            "remote_port": p,
-            "latency_ms": latency,
-            "probe_status": "available" if ok else "unavailable",
-            "probe_message": message,
+def _probe_one_node(node: dict[str, Any]) -> dict[str, Any]:
+    """完整验证单个节点，但不读取或写入节点池。"""
+    node_id = node["id"]
+    config_text = node.get("config_text") or ""
+    host = str(node.get("remote_host") or node.get("ip"))
+    port = parse_int(node.get("remote_port"))
+    fallback_ping = parse_int(node.get("ping"))
+    temp_path = test_config_path(node_id)
+    try:
+        CONFIG_DIR.mkdir(exist_ok=True, parents=True)
+        temp_path.write_text(config_text, encoding="utf-8")
+    except Exception as exc:
+        return {
+            **node,
+            "latency_ms": 0,
+            "probe_status": "unavailable",
+            "probe_message": f"Failed to write configuration: {exc}",
             "probed_at": time.time(),
             "owner": "",
             "asn": "",
@@ -1408,43 +1364,101 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
             "ip_type": "",
             "quality": "",
         }
-        return temp_node
 
-    updated_nodes_map = dict(dead_prescreen)
-    max_workers = min(OPENVPN_TEST_CONCURRENCY, max(1, len(to_test)))
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(test_worker, (idx, n)): n["id"] for idx, n in enumerate(to_test)}
-        for future in concurrent.futures.as_completed(futures):
-            nid = futures[future]
-            try:
-                res = future.result()
-                updated_nodes_map[nid] = res
-            except Exception as e:
-                updated_nodes_map[nid] = {
-                    "id": nid,
-                    "probe_status": "unavailable",
-                    "probe_message": f"Test exception: {e}",
-                    "latency_ms": 0
-                }
-                
-    # 批量查询并丰富可用节点的地理及 ISP 信息，防止并发时被定位 API 接口限流
-    successful_nodes = [res for res in updated_nodes_map.values() if res.get("probe_status") == "available"]
-    if successful_nodes:
+    latency = vpn_utils.ping_latency_ms(host, port, fallback_ping)
+    tun_index = None
+    try:
+        tun_index = get_free_test_index()
+        ok, message, _ = run_openvpn_until_ready(
+            str(temp_path),
+            keep_alive=False,
+            route_nopull=True,
+            timeout=12,
+            dev=f"tun{tun_index}",
+        )
+    finally:
+        if tun_index is not None:
+            release_test_index(tun_index)
         try:
-            vpn_utils.enrich_ip_info(successful_nodes)
-        except Exception as ee:
-            print(f"[test_multiple_nodes] 批量富化 IP 失败: {ee}", flush=True)
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
+    return {
+        **node,
+        "ip": node.get("ip") or host,
+        "remote_host": host,
+        "remote_port": port,
+        "latency_ms": latency,
+        "probe_status": "available" if ok else "unavailable",
+        "probe_message": message,
+        "probed_at": time.time(),
+        "owner": "",
+        "asn": "",
+        "as_name": "",
+        "location": "",
+        "ip_type": "",
+        "quality": "",
+    }
+
+
+def probe_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """分层并发验证一批节点，返回输入顺序的结果且不持久化。"""
+    dead_prescreen = tcp_prescreen_dead(nodes)
+    if dead_prescreen:
+        print(
+            f"[分层测速] TCP 预筛淘汰 {len(dead_prescreen)} 个不可达节点，"
+            f"剩余 {len(nodes) - len(dead_prescreen)} 个进入 OpenVPN 测试",
+            flush=True,
+        )
+
+    by_id = {str(node.get("id") or ""): node for node in nodes}
+    results = {
+        node_id: {**by_id.get(node_id, {}), **result}
+        for node_id, result in dead_prescreen.items()
+    }
+    remaining = [node for node in nodes if node.get("id") not in dead_prescreen]
+    workers = min(OPENVPN_TEST_CONCURRENCY, max(1, len(remaining)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(_probe_one_node, node): node["id"] for node in remaining}
+        for future in concurrent.futures.as_completed(futures):
+            node_id = futures[future]
+            try:
+                results[node_id] = future.result()
+            except Exception as exc:
+                results[node_id] = {
+                    **by_id[node_id],
+                    "probe_status": "unavailable",
+                    "probe_message": f"Test exception: {exc}",
+                    "latency_ms": 0,
+                    "probed_at": time.time(),
+                }
+
+    successful = [item for item in results.values() if item.get("probe_status") == "available"]
+    if successful:
+        try:
+            vpn_utils.enrich_ip_info(successful)
+        except Exception as exc:
+            print(f"[probe_nodes] 批量富化 IP 失败: {exc}", flush=True)
+    return [results[node["id"]] for node in nodes if node.get("id") in results]
+
+
+def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
+    """按 ID 验证当前可见节点，并把结果写回节点池。"""
     with lock:
         current_nodes = read_nodes()
-        for n in current_nodes:
-            nid = n.get("id")
-            if nid in updated_nodes_map:
-                n.update(updated_nodes_map[nid])
-        sorted_nodes = sort_all_nodes(current_nodes)
-        write_json(NODES_FILE, sorted_nodes)
-        
-    return list(updated_nodes_map.values())
+        to_test = [node for node in current_nodes if node.get("id") in node_ids]
+
+    results = probe_nodes(to_test)
+    results_by_id = {item["id"]: item for item in results}
+    with lock:
+        current_nodes = read_nodes()
+        for node in current_nodes:
+            node_id = node.get("id")
+            if node_id in results_by_id:
+                node.update(results_by_id[node_id])
+        write_json(NODES_FILE, sort_all_nodes(current_nodes))
+    return results
 
 def mark_main_bad_node(node_id: str) -> None:
     """把主连接出口不通的节点加入冷却名单，冷却期内 auto_switch_node 不会再选回它。"""
