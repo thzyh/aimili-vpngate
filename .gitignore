@@ -31,6 +31,7 @@ logs/
 *.pid
 
 # ---- IDE 和编辑器 ----
+.worktrees/
 .vscode/
 .idea/
 *.swp
