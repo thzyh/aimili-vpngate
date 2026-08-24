@@ -16,6 +16,21 @@ def node(index, status="not_checked", active=False):
 
 
 class PoolMaintenanceTests(unittest.TestCase):
+    def test_storage_sort_excludes_unavailable_and_untested_nodes(self):
+        manager.active_openvpn_node_id = "live"
+        try:
+            stored = manager.sort_all_nodes(
+                [
+                    node(1, "available"),
+                    node(2, "unavailable"),
+                    node(3, "not_checked"),
+                    {**node(4, "unavailable", True), "id": "live"},
+                ]
+            )
+        finally:
+            manager.active_openvpn_node_id = ""
+        self.assertEqual([item["id"] for item in stored], ["n1", "live"])
+
     def test_replenishes_from_later_candidates_until_target(self):
         existing = [
             node(0, "available"),

@@ -432,7 +432,7 @@ def clear_active_connection_state(message: str) -> None:
         nodes = read_nodes()
         for item in nodes:
             item["active"] = False
-        write_json(NODES_FILE, nodes)
+        write_json(NODES_FILE, sort_all_nodes(nodes))
     set_state(
         active_openvpn_node_id="",
         is_connecting=False,
@@ -1200,23 +1200,21 @@ def active_openvpn_running() -> bool:
     return active_openvpn_process is not None and active_openvpn_process.poll() is None
 
 def sort_all_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    runtime_active_id = str(active_openvpn_node_id or "")
     available_nodes = sorted(
-        [n for n in nodes if n.get("probe_status") == "available" or n.get("active")],
+        [
+            n
+            for n in nodes
+            if n.get("probe_status") == "available"
+            or (runtime_active_id and str(n.get("id") or "") == runtime_active_id)
+        ],
         key=lambda n: (
             0 if n.get("ip_type") in ("residential", "mobile") else 1,
             parse_int(n.get("latency_ms")) or 999999,
             -parse_int(n.get("score"))
         )
     )
-    untested_nodes = sorted(
-        [n for n in nodes if n.get("probe_status") == "not_checked" and not n.get("active")],
-        key=lambda n: (-parse_int(n.get("score")), parse_int(n.get("ping")))
-    )
-    unavailable_nodes = sorted(
-        [n for n in nodes if n.get("probe_status") == "unavailable" and not n.get("active")],
-        key=lambda n: (-parse_int(n.get("score")), -float(n.get("probed_at", 0)))
-    )
-    return available_nodes + untested_nodes + unavailable_nodes
+    return available_nodes
 
 active_test_indexes = set()
 test_indexes_lock = threading.Lock()
@@ -1300,6 +1298,8 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
                 node["location"] = temp_node["location"]
                 node["ip_type"] = temp_node["ip_type"]
                 node["quality"] = temp_node["quality"]
+            else:
+                mark_blacklisted(node, message)
             
             sorted_nodes = sort_all_nodes(nodes)
             write_json(NODES_FILE, sorted_nodes)
@@ -1460,6 +1460,9 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
 
     results = probe_nodes(to_test)
     results_by_id = {item["id"]: item for item in results}
+    for item in results:
+        if item.get("probe_status") != "available":
+            mark_blacklisted(item, item.get("probe_message") or "OpenVPN 节点验证失败")
     with lock:
         current_nodes = read_nodes()
         for node in current_nodes:
@@ -1678,7 +1681,7 @@ def auto_switch_node(attempt: int = 0) -> None:
             nodes = read_nodes()
             for item in nodes:
                 item["active"] = False
-            write_json(NODES_FILE, nodes)
+            write_json(NODES_FILE, sort_all_nodes(nodes))
         set_state(active_openvpn_node_id="", last_check_message=msg)
         
         def bg_fetch_and_switch():
@@ -1742,9 +1745,10 @@ def connect_node(node_id: str) -> str:
                 pass
             node["probe_status"] = "unavailable"
             node["probe_message"] = message
+            mark_blacklisted(node, message)
             for item in nodes:
                 item["active"] = False
-            write_json(NODES_FILE, nodes)
+            write_json(NODES_FILE, sort_all_nodes(nodes))
             log_to_json("ERROR", "VPN", f"连接节点 {node_id} 失败: {message}")
             print(f"[连接核心失败] 无法与 VPN 节点 {node_id} 建立隧道连接！详情: {message}", flush=True)
             set_state(active_openvpn_node_id="", is_connecting=False, active_node_latency="无活动连接", last_check_message=f"连接失败: {message}")
@@ -1779,7 +1783,7 @@ def connect_node(node_id: str) -> str:
             if item["active"]:
                 _ph = f"[{LOCAL_PROXY_HOST}]" if ":" in LOCAL_PROXY_HOST else LOCAL_PROXY_HOST
                 item["probe_message"] = f"Active node. HTTP proxy: http://{_ph}:{LOCAL_PROXY_PORT}"
-        write_json(NODES_FILE, nodes)
+        write_json(NODES_FILE, sort_all_nodes(nodes))
         
         set_state(last_check_message="正在测试本地代理出站联通性与出口 IP...")
         res = check_proxy_health()
@@ -6101,7 +6105,7 @@ def background_proxy_checker() -> None:
                             if active_node:
                                 mark_blacklisted(active_node, f"代理连通性检测失败: {error_msg}")
                                 active_node["probe_status"] = "unavailable"
-                                write_json(NODES_FILE, nodes)
+                                write_json(NODES_FILE, sort_all_nodes(nodes))
                         # 把当前(假活/不转发)节点加入冷却，确保 auto_switch_node 切到“真能转发”的别的节点
                         mark_main_bad_node(active_openvpn_node_id)
                         auto_switch_node()
@@ -6821,7 +6825,7 @@ class Handler(BaseHTTPRequestHandler):
                     nodes = read_nodes()
                     for item in nodes:
                         item["active"] = False
-                    write_json(NODES_FILE, nodes)
+                    write_json(NODES_FILE, sort_all_nodes(nodes))
                 global last_active_ping_time, last_active_latency
                 last_active_ping_time = 0.0
                 last_active_latency = 0
