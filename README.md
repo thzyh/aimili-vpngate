@@ -19,7 +19,7 @@ Bilingual: [中文](#中文) | [English](#english)
 - 🧠 **代理链路优化**：隧道内 DNS 解析加入缓存与多上游 DNS 竞速；本地代理转发改为非阻塞双向泵，修复了原半双工阻塞风险并支持半关闭传播。
 - 🛡️ **多出口可靠性**：供给器非阻塞互斥避免并发重入，进程重启时自动回收遗留隧道孤儿进程。
 
-> 🔱 **二次开发声明**：本仓库基于上游原项目 [baoweise-bot/aimili-vpngate](https://github.com/baoweise-bot/aimili-vpngate) 二次开发（Fork），保留其全部原有能力。原项目版权归原作者所有，在此向上游致谢。本仓库仅维护本二开版本的新增特性与适配。完整改动见 [CHANGELOG.md](./CHANGELOG.md)。
+> 🔱 **二次开发声明**：本仓库基于 [Guli-Joy/aimili-vpngate](https://github.com/Guli-Joy/aimili-vpngate) 定制维护；该项目源自 [baoweise-bot/aimili-vpngate](https://github.com/baoweise-bot/aimili-vpngate)。原项目版权归原作者所有，在此向各级上游致谢。完整改动见 [CHANGELOG.md](./CHANGELOG.md)。
 
 ---
 
@@ -28,12 +28,12 @@ Bilingual: [中文](#中文) | [English](#english)
 在你的 Linux VPS 上以 root 执行：
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/Guli-Joy/aimili-vpngate/main/install.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/thzyh/aimili-vpngate/custom/install.sh)
 ```
 
 > 💡 安装脚本会自动识别包管理器（apt/apk/dnf/yum）安装依赖（openvpn、python3、iproute2、iptables 等）、注册系统服务（systemd 或 OpenRC）、生成随机管理员账号密码与带安全后缀的后台地址，并安装交互式命令行菜单 `ml`。部署完成后终端会打印专属后台链接，如 `http://你的IP:8787/u71e9IXp4TPx`。
 
-如需指定自定义仓库（例如你自己的二开分叉）：`bash install.sh <github_user> <repo_name>`。
+如需指定其他部署源：`bash install.sh <github_user> <repo_name> [branch] [commit_or_tag]`。第四个参数可固定到经过验证的提交。
 
 #### 🔄 已部署过？这样更新
 **直接重跑上面的一键命令即可**——脚本会对已存在的 `/opt/aimilivpn` 执行 `git fetch` + 强制重置到最新源码并重启服务，**保留你的账号密码与全部配置**（`vpngate_data/` 不会被动）。
@@ -233,7 +233,7 @@ DNS 污染或域名被拦截。可在「管理员 → 代理设置」配置上�
 Run as root on your Linux VPS:
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/Guli-Joy/aimili-vpngate/main/install.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/thzyh/aimili-vpngate/custom/install.sh)
 ```
 
 It auto-detects the package manager (apt/apk/dnf/yum), installs deps, registers a service (systemd/OpenRC), generates random admin credentials and a secret-suffixed UI URL, and installs the `ml` CLI. Copy the printed URL (e.g. `http://your_ip:8787/u71e9IXp4TPx`) to access the panel.

@@ -47,13 +47,16 @@ echo -e "${BLUE}        欢迎使用 AimiliVPN 一键源码部署与管理脚本
 echo -e "${BLUE}==========================================================${PLAIN}"
 
 # 3. Configure GitHub Repository URL
-# 二开仓库默认指向 Guli-Joy/aimili-vpngate（上游原项目: baoweise-bot/aimili-vpngate）
-DEFAULT_USER="Guli-Joy"
+# 定制仓库默认指向 thzyh/aimili-vpngate（上游: Guli-Joy/aimili-vpngate）
+DEFAULT_USER="thzyh"
 DEFAULT_REPO="aimili-vpngate"
+DEFAULT_DEPLOY_BRANCH="custom"
 
-# Allow custom repository override via command line arguments
+# 参数：GitHub 用户、仓库、部署分支、可选固定提交/标签。
 GITHUB_USER="${1:-${DEFAULT_USER}}"
 GITHUB_REPO="${2:-${DEFAULT_REPO}}"
+REQUESTED_BRANCH="${3:-}"
+DEPLOY_REF="${4:-}"
 
 GITHUB_URL="https://github.com/${GITHUB_USER}/${GITHUB_REPO}.git"
 
@@ -82,17 +85,20 @@ fi
 
 # 4. Clone or pull the repository
 INSTALL_DIR="/opt/aimilivpn"
-# 默认部署分支（在 bate 分支设为 bate；在 main 分支设为 main）
-DEFAULT_DEPLOY_BRANCH="main"
 
-# 自动检测本地已安装版本当前所在的分支
-CURRENT_BRANCH=""
-if [ -d "${INSTALL_DIR}/.git" ]; then
-    CURRENT_BRANCH=$(cd "${INSTALL_DIR}" && git rev-parse --abbrev-ref HEAD 2>/dev/null)
-fi
-DEPLOY_BRANCH="${CURRENT_BRANCH:-$DEFAULT_DEPLOY_BRANCH}"
+DEPLOY_BRANCH="${REQUESTED_BRANCH:-$DEFAULT_DEPLOY_BRANCH}"
 
-echo -e "\n${YELLOW}[2/4] 正在从 GitHub 部署源代码到 ${INSTALL_DIR} (目标分支: ${DEPLOY_BRANCH})...${PLAIN}"
+apply_deploy_ref() {
+    [ -n "$DEPLOY_REF" ] || return 0
+    if ! git cat-file -e "${DEPLOY_REF}^{commit}" 2>/dev/null; then
+        echo -e "${RED}  -> 错误: 仓库中不存在指定提交或标签 ${DEPLOY_REF}${PLAIN}"
+        exit 1
+    fi
+    echo -e "  -> 正在固定源码到 ${DEPLOY_REF} ..."
+    git reset --hard "${DEPLOY_REF}"
+}
+
+echo -e "\n${YELLOW}[2/4] 正在从 GitHub 部署源代码到 ${INSTALL_DIR} (目标分支: ${DEPLOY_BRANCH}${DEPLOY_REF:+, 固定版本: ${DEPLOY_REF}})...${PLAIN}"
 if [ -f "${INSTALL_DIR}/.local_dev" ]; then
     echo -e "${GREEN}检测到本地开发模式 (.local_dev)，跳过 git pull/reset 保持本地修改。${PLAIN}"
 else
@@ -109,25 +115,33 @@ else
         fi
         git fetch --all || true
         git checkout "${DEPLOY_BRANCH}" || git checkout -b "${DEPLOY_BRANCH}" "origin/${DEPLOY_BRANCH}" || true
-        echo -e "  -> 正在强制重置本地源码至 origin/${DEPLOY_BRANCH} ..."
-        if git reset --hard "origin/${DEPLOY_BRANCH}"; then
-            echo -e "${GREEN}  -> 源码更新成功！${PLAIN}"
+        if [ -n "$DEPLOY_REF" ]; then
+            apply_deploy_ref
+            echo -e "${GREEN}  -> 固定版本部署成功！${PLAIN}"
         else
-            if git pull origin "${DEPLOY_BRANCH}"; then
+            echo -e "  -> 正在强制重置本地源码至 origin/${DEPLOY_BRANCH} ..."
+            if git reset --hard "origin/${DEPLOY_BRANCH}"; then
                 echo -e "${GREEN}  -> 源码更新成功！${PLAIN}"
             else
-                echo -e "${YELLOW}  -> 警告: git pull/reset 失败，将保留当前本地源码并继续安装。${PLAIN}"
+                if git pull origin "${DEPLOY_BRANCH}"; then
+                    echo -e "${GREEN}  -> 源码更新成功！${PLAIN}"
+                else
+                    echo -e "${YELLOW}  -> 警告: git pull/reset 失败，将保留当前本地源码并继续安装。${PLAIN}"
+                fi
             fi
         fi
     else
         echo -e "  -> 正在克隆 GitHub 仓库 ${GITHUB_URL} (分支: ${DEPLOY_BRANCH}) ..."
         if git clone -b "${DEPLOY_BRANCH}" "${GITHUB_URL}" "${INSTALL_DIR}"; then
+            cd "${INSTALL_DIR}"
+            apply_deploy_ref
             echo -e "${GREEN}  -> 克隆成功！${PLAIN}"
         else
             echo -e "  -> 尝试默认克隆..."
             if git clone "${GITHUB_URL}" "${INSTALL_DIR}"; then
                 cd "${INSTALL_DIR}"
                 git checkout "${DEPLOY_BRANCH}" || git checkout -b "${DEPLOY_BRANCH}" "origin/${DEPLOY_BRANCH}" || true
+                apply_deploy_ref
                 echo -e "${GREEN}  -> 克隆成功！${PLAIN}"
             else
                 echo -e "${RED}  -> 错误: 无法克隆仓库 ${GITHUB_URL}，请检查网络！${PLAIN}"

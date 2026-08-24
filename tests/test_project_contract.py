@@ -23,6 +23,24 @@ class ProjectContractTests(unittest.TestCase):
         self.assertIn("probe_status", text)
         self.assertIn("unavailable", text)
 
+    def test_installer_defaults_to_custom_fork_and_supports_pinned_ref(self):
+        installer = (ROOT / "install.sh").read_text(encoding="utf-8")
+        self.assertIn('DEFAULT_USER="thzyh"', installer)
+        self.assertIn('DEFAULT_DEPLOY_BRANCH="custom"', installer)
+        self.assertIn('DEPLOY_REF="${4:-}"', installer)
+        self.assertIn(
+            'DEPLOY_BRANCH="${REQUESTED_BRANCH:-$DEFAULT_DEPLOY_BRANCH}"',
+            installer,
+        )
+        self.assertIn('git reset --hard "${DEPLOY_REF}"', installer)
+
+    def test_readme_install_command_uses_custom_fork(self):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn(
+            "raw.githubusercontent.com/thzyh/aimili-vpngate/custom/install.sh",
+            readme,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
