@@ -5,6 +5,19 @@
 
 ---
 
+## [Custom 1.1.0] - 2026-08-24
+
+### 新增 (Added)
+
+- **有效节点池自动补充**：既有有效节点优先复验，失败节点立即移出可见列表并进入冷却；有效数量不足时继续向 VPNGate API 列表后部按批次补测，达到目标或候选耗尽后停止。
+- 新增 `TARGET_VALID_POOL_SIZE`、`MAX_FETCH_ROWS`、`NODE_TEST_BATCH_SIZE` 和 `PROBE_FAILURE_COOLDOWN_SECONDS` 环境变量；兼容读取旧的 `TARGET_VALID_NODES` 和 `MAX_SCAN_ROWS`。
+- 新增纯标准库自动化测试，覆盖候选优先级、失败冷却、列表后部补测、候选耗尽停止、API 失败保留现有节点池，以及探测与持久化隔离。
+
+### 变更 (Changed)
+
+- `nodes.json` 只保存已验证有效节点和当前活动节点，不再长期展示 `unavailable` 节点。
+- OpenVPN 精验改为小批次执行，低内存 VPS 可以维持较大的候选读取范围而不同时启动大量探测。
+
 ## [Fork 1.0.1] - 2026-06-14
 
 主连接(7928)可靠性修复：根治节点自动切换后下游 3x-ui/Xray 需手动重启才恢复的问题。

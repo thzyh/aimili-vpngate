@@ -99,6 +99,8 @@ flowchart LR
 - **固定国家地区**：只选指定国家（如 JP、KR、US）最佳节点。
 - **固定 IP 节点**：锁定单一节点。
 
+节点维护采用“有效池补充”方式：程序保留并优先复验上一轮有效节点，把验证失败的节点移出可见列表并放入冷却区，然后继续测试 VPNGate 列表后部的新候选。达到目标有效数量或当前候选全部测试完后自动停止，不会反复测试同一批失败节点。有效节点的实际数量仍受 VPNGate 当时在线节点供给限制。
+
 #### 第三步：使用本机代理（核心）
 为防止端口被公网滥用扫描，双效代理（默认 **`7928`**，自适应 SOCKS5 / HTTP）**默认仅绑定 `127.0.0.1`**，只接收 VPS 本机流量。
 
@@ -180,6 +182,10 @@ bash scripts/selfcheck_multiexit.sh
 | `LOCAL_PROXY_HOST` | `127.0.0.1` | 本地代理绑定地址（设 `::` 可对公网开放） |
 | `LOCAL_PROXY_PORT` | `7928` | 主代理端口 |
 | `UI_PORT` | `8787` | 管理后台端口 |
+| `TARGET_VALID_POOL_SIZE` | `30` | 期望保留的有效节点数，达到后停止本轮补测 |
+| `MAX_FETCH_ROWS` | `300` | 单次 API 快照最多读取的唯一候选数 |
+| `NODE_TEST_BATCH_SIZE` | `10` | 每批送入 OpenVPN 精验的候选数 |
+| `PROBE_FAILURE_COOLDOWN_SECONDS` | `1800` | 失败节点重新允许测试前的冷却秒数 |
 | `OPENVPN_TEST_CONCURRENCY` | `8` | OpenVPN 精验并发数 |
 | `TCP_PRESCREEN_CONCURRENCY` | `100` | TCP 粗筛并发数 |
 | `MAX_EXIT_SLOTS` | `16` | 多出口槽位上限 |

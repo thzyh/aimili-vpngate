@@ -11,6 +11,7 @@ set -u
 
 DATA_DIR="${1:-${VPNGATE_DATA_DIR:-/opt/aimilivpn/vpngate_data}}"
 SLOTS_FILE="${DATA_DIR}/slots.json"
+NODES_FILE="${DATA_DIR}/nodes.json"
 PROXY_HOST="127.0.0.1"
 
 GREEN=$'\033[0;32m'; RED=$'\033[0;31m'; YELLOW=$'\033[1;33m'; BLUE=$'\033[0;34m'; PLAIN=$'\033[0m'
@@ -31,6 +32,29 @@ fi
 need curl || warn "未安装 curl，将跳过真实出口 IP 检测"
 need ip   || { bad "缺少 iproute2 (ip 命令)"; exit 1; }
 if need ss; then LISTEN_CMD="ss -ltnH"; elif need netstat; then LISTEN_CMD="netstat -ltn"; else LISTEN_CMD=""; warn "无 ss/netstat，将跳过端口监听检测"; fi
+
+if [ -f "$NODES_FILE" ]; then
+  if python3 - "$NODES_FILE" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+nodes = json.loads(path.read_text(encoding="utf-8"))
+invalid = [node.get("id", "") for node in nodes if node.get("probe_status") == "unavailable"]
+if invalid:
+    raise SystemExit(f"节点池仍包含 {len(invalid)} 个 unavailable 节点")
+print(f"有效节点池检查通过：当前可见节点 {len(nodes)} 个")
+PY
+  then
+    ok "可见节点池未包含 unavailable 节点"
+  else
+    bad "可见节点池检查失败"
+    exit 1
+  fi
+else
+  warn "未找到 ${NODES_FILE}，跳过有效节点池检查"
+fi
 
 if [ ! -f "$SLOTS_FILE" ]; then
   bad "未找到 ${SLOTS_FILE}（多出口可能未启用：后台 → 多出口住宅IP → 设数量>0）"
