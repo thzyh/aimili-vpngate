@@ -77,6 +77,7 @@ class DualStackHTTPServer(ThreadingHTTPServer):
 
 import vpn_utils
 import proxy_server
+import node_pool
 
 def env_int(name: str, default: int, min_value: int | None = None, max_value: int | None = None) -> int:
     raw = os.environ.get(name)
@@ -107,8 +108,13 @@ def bounded_int(value: Any, default: int, min_value: int | None = None, max_valu
 API_URL = "https://www.vpngate.net/api/iphone/"
 FETCH_INTERVAL_SECONDS = env_int("FETCH_INTERVAL_SECONDS", 1260, 1)
 CHECK_INTERVAL_SECONDS = env_int("CHECK_INTERVAL_SECONDS", 1260, 1)
-TARGET_VALID_NODES = env_int("TARGET_VALID_NODES", 3, 1)
-MAX_SCAN_ROWS = env_int("MAX_SCAN_ROWS", 300, 1)
+_legacy_max_scan_rows = env_int("MAX_SCAN_ROWS", 300, 1)
+MAX_FETCH_ROWS = env_int("MAX_FETCH_ROWS", _legacy_max_scan_rows, 1)
+_legacy_target_valid_nodes = env_int("TARGET_VALID_NODES", 30, 1)
+TARGET_VALID_POOL_SIZE = env_int("TARGET_VALID_POOL_SIZE", _legacy_target_valid_nodes, 1)
+TARGET_VALID_NODES = TARGET_VALID_POOL_SIZE
+NODE_TEST_BATCH_SIZE = env_int("NODE_TEST_BATCH_SIZE", 10, 1)
+PROBE_FAILURE_COOLDOWN_SECONDS = env_int("PROBE_FAILURE_COOLDOWN_SECONDS", 1800, 1)
 OPENVPN_TEST_TIMEOUT_SECONDS = env_int("OPENVPN_TEST_TIMEOUT_SECONDS", 35, 1)
 OPENVPN_TEST_CONCURRENCY = env_int("OPENVPN_TEST_CONCURRENCY", 8, 1, 64)
 TCP_PRESCREEN_CONCURRENCY = env_int("TCP_PRESCREEN_CONCURRENCY", 100, 1, 512)
@@ -772,6 +778,7 @@ def fetch_candidates() -> list[dict[str, Any]]:
     blacklist = load_blacklist()
     candidates: list[dict[str, Any]] = []
     seen_ips = set()
+    fetch_succeeded = False
     
     # 检查本地是否有节点缓存，以确定最大重试尝试次数
     has_cache = len(cached_nodes()) > 0
@@ -798,7 +805,10 @@ def fetch_candidates() -> list[dict[str, Any]]:
                 log_to_json("INFO", "Main", msg)
                 api_text = fetch_api_text(url, verify_ssl)
                 rows = parse_vpngate_rows(api_text)
-                for row in rows[:MAX_SCAN_ROWS]:
+                fetch_succeeded = True
+                for row in rows:
+                    if len(candidates) >= MAX_FETCH_ROWS:
+                        break
                     ip = row.get("IP", "")
                     if not ip or ip in seen_ips:
                         continue
@@ -817,16 +827,15 @@ def fetch_candidates() -> list[dict[str, Any]]:
                         continue
                     candidates.append(node)
                     seen_ips.add(ip)
-                if candidates:
-                    break
+                break
             except Exception as e:
                 last_err = e
                 print(f"[fetch_candidates] 拉取失败 (URL: {url}, 验证: {verify_ssl}): {e}", flush=True)
                 log_to_json("WARNING", "Main", f"拉取失败 (URL: {url}, 验证: {verify_ssl}): {e}")
-        if candidates:
+        if fetch_succeeded:
             break
             
-    if not candidates:
+    if not fetch_succeeded:
         err_code, diag_msg = vpn_utils.diagnose_api_failure(API_URL)
         full_err_msg = f"获取官方 API 节点最终失败: {last_err} | 诊断结果: {diag_msg}"
         print(f"[错误代码 {err_code}] {full_err_msg}", flush=True)
@@ -1460,6 +1469,100 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
         write_json(NODES_FILE, sort_all_nodes(current_nodes))
     return results
 
+
+def replenish_valid_pool(
+    existing_nodes: list[dict[str, Any]],
+    candidates: list[dict[str, Any]],
+    blacklist: dict[str, dict[str, Any]],
+    probe_batch,
+    now: float | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], dict[str, Any]]:
+    """复验既有节点并分批补池，直到达到目标或候选耗尽。"""
+    checked_at = time.time() if now is None else now
+    pool = node_pool.protected_active_nodes(existing_nodes, active_openvpn_node_id)
+    protected_ids = {str(item.get("id") or "") for item in pool}
+    failed_entries = dict(blacklist)
+    for item in existing_nodes:
+        node_id = str(item.get("id") or "")
+        if (
+            node_id
+            and node_id not in protected_ids
+            and item.get("probe_status") == "unavailable"
+        ):
+            failed_entries[node_id] = {
+                "id": node_id,
+                "ip": item.get("ip") or item.get("remote_host") or "",
+                "country": item.get("country", ""),
+                "reason": item.get("probe_message") or "上一轮 OpenVPN 节点验证失败",
+                "marked_at": checked_at,
+                "until": checked_at + PROBE_FAILURE_COOLDOWN_SECONDS,
+            }
+    preferred_ids = {
+        str(item.get("id") or "")
+        for item in existing_nodes
+        if item.get("probe_status") == "available" and not item.get("active")
+    }
+    tested_ids: set[str] = set()
+    tested_count = 0
+    batch_count = 0
+
+    while len(pool) < TARGET_VALID_POOL_SIZE:
+        queue = node_pool.candidate_queue(
+            candidates,
+            pool,
+            failed_entries,
+            tested_ids,
+            checked_at,
+            preferred_ids,
+        )
+        if not queue:
+            return pool, failed_entries, {
+                "tested": tested_count,
+                "batches": batch_count,
+                "stop_reason": "candidates_exhausted",
+            }
+
+        batch = queue[:NODE_TEST_BATCH_SIZE]
+        batch_ids = {str(item.get("id") or "") for item in batch}
+        tested_ids.update(batch_ids)
+        results = list(probe_batch(batch) or [])
+        returned_ids = {str(item.get("id") or "") for item in results}
+        for item in batch:
+            node_id = str(item.get("id") or "")
+            if node_id not in returned_ids:
+                results.append(
+                    {
+                        **item,
+                        "probe_status": "unavailable",
+                        "probe_message": "节点探测未返回结果",
+                        "probed_at": checked_at,
+                    }
+                )
+
+        tested_count += len(batch)
+        batch_count += 1
+        pool, failed = node_pool.merge_probe_results(
+            pool, results, TARGET_VALID_POOL_SIZE
+        )
+        for item in failed:
+            node_id = str(item.get("id") or "")
+            if not node_id:
+                continue
+            failed_entries[node_id] = {
+                "id": node_id,
+                "ip": item.get("ip") or item.get("remote_host") or "",
+                "country": item.get("country", ""),
+                "reason": item.get("probe_message") or "OpenVPN 节点验证失败",
+                "marked_at": checked_at,
+                "until": checked_at + PROBE_FAILURE_COOLDOWN_SECONDS,
+            }
+
+    return pool, failed_entries, {
+        "tested": tested_count,
+        "batches": batch_count,
+        "stop_reason": "target_reached",
+    }
+
 def mark_main_bad_node(node_id: str) -> None:
     """把主连接出口不通的节点加入冷却名单，冷却期内 auto_switch_node 不会再选回它。"""
     nid = str(node_id or "").strip()
@@ -1752,6 +1855,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
                         auto_switch_node()
                         is_connecting = True
 
+        existing_nodes = read_nodes()
         try:
             set_state(is_connecting=True, last_check_message="正在拉取最新的免费 VPN 节点列表...")
             candidates = fetch_candidates()
@@ -1762,68 +1866,46 @@ def maintain_valid_nodes(force: bool = False) -> str:
                 err_code, raw_diag = vpn_utils.diagnose_api_failure(API_URL)
                 diag_msg = f"[错误代码 {err_code}] 获取节点失败: {exc} | 诊断结果: {raw_diag}"
             set_state(last_fetch_at=time.time(), last_fetch_status="error", last_fetch_message=diag_msg)
-            candidates = []
+            return f"获取节点失败，保留现有有效节点 {len(existing_nodes)} 个"
 
-        if not candidates:
-            return "没有拉取到新节点"
-
-        with lock:
-            active_node = None
-            if active_openvpn_node_id:
-                current_nodes = read_nodes()
-                active_node = next((n for n in current_nodes if n.get("id") == active_openvpn_node_id), None)
-                
-            merged: list[dict[str, Any]] = []
-            seen_ids: set[str] = set()
-            
-            if active_node:
-                merged.append(active_node)
-                seen_ids.add(active_node["id"])
-                
-            for cand in candidates:
-                if cand["id"] not in seen_ids:
-                    merged.append(cand)
-                    seen_ids.add(cand["id"])
-                    
-            if len(merged) > 1000:
-                merged = merged[:1000]
-                
-            for n in merged:
-                config_path = Path(n["config_file"])
-                if not config_path.exists():
-                    try:
-                        config_path.write_text(n["config_text"], encoding="utf-8")
-                    except Exception:
-                        pass
-                        
-            write_json(NODES_FILE, merged)
-
-        # Test all non-active nodes from the list
-        with lock:
-            current_nodes = read_nodes()
-            to_test = [n for n in current_nodes if not n.get("active")]
-            to_test_ids = [n["id"] for n in to_test]
-            
-        msg = f"开始对列表中所有候选节点进行周期连通性与延迟测试，待检测节点共 {len(to_test_ids)} 个"
+        msg = (
+            f"开始维护有效节点池：现有可见节点 {len(existing_nodes)} 个，"
+            f"本轮官方候选 {len(candidates)} 个，目标 {TARGET_VALID_POOL_SIZE} 个"
+        )
         print(f"[周期检测] {msg}", flush=True)
         log_to_json("INFO", "Main", msg)
-        
-        set_state(is_connecting=True, last_check_message="正在并发检测所有节点可用性...")
-        test_multiple_nodes(to_test_ids)
+
+        set_state(is_connecting=True, last_check_message="正在分批复验并补充有效节点...")
+        merged, blacklist, pool_stats = replenish_valid_pool(
+            existing_nodes,
+            candidates,
+            load_blacklist(),
+            probe_nodes,
+        )
+        merged = sort_all_nodes(merged)
+        for node in merged:
+            config_file = str(node.get("config_file") or "")
+            config_text = str(node.get("config_text") or "")
+            if not config_file or not config_text:
+                continue
+            config_path = Path(config_file)
+            if not config_path.exists():
+                try:
+                    config_path.write_text(config_text, encoding="utf-8")
+                except OSError as exc:
+                    print(f"[节点池] 保存节点配置 {node.get('id')} 失败: {exc}", flush=True)
+        write_json(BLACKLIST_FILE, blacklist)
+        write_json(NODES_FILE, merged)
         is_connecting = False
-        
+
         with lock:
-            merged = read_nodes()
-            
-            # Identify available, unavailable, and active nodes
             available_nodes = [n["id"] for n in merged if n.get("probe_status") == "available"]
-            unavailable_nodes = [n["id"] for n in merged if n.get("probe_status") == "unavailable"]
             active_node = next((n["id"] for n in merged if n.get("active")), "无")
-            
+
             status_report = (
-                f"周期节点检测完成。实时同步状态: 获取到候选节点共 {len(merged)} 个。 "
-                f"其中【可用节点】{len(available_nodes)} 个: {available_nodes[:15]}...; "
-                f"【不可用节点】{len(unavailable_nodes)} 个; "
+                f"周期节点检测完成。官方候选 {len(candidates)} 个，本轮测试 "
+                f"{pool_stats['tested']} 个，当前【有效节点池】{len(available_nodes)} 个；"
+                f"停止原因: {pool_stats['stop_reason']}；"
                 f"当前【正在正常运行的活动连接节点】为: {active_node}。"
             )
             print(f"[周期检测] {status_report}", flush=True)
@@ -1870,7 +1952,10 @@ def maintain_valid_nodes(force: bool = False) -> str:
                             auto_switch_node()
 
         valid_nodes_count = len([n for n in merged if n.get("probe_status") == "available"])
-        message = f"Fetched {len(candidates)} nodes. Tested {len(to_test_ids)} non-active nodes."
+        message = (
+            f"Fetched {len(candidates)} candidates. Tested {pool_stats['tested']} nodes. "
+            f"Valid pool: {valid_nodes_count}. Stop: {pool_stats['stop_reason']}."
+        )
         set_state(
             last_check_at=time.time(),
             last_check_message=message,
