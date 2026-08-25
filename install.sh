@@ -151,6 +151,32 @@ else
     fi
 fi
 
+# 4.5 Configure loopback control API credentials. Existing tokens are retained
+# across updates so dependent local services do not lose access.
+CONTROL_DIR="/etc/aimilivpn"
+CONTROL_TOKEN_FILE="${CONTROL_DIR}/control.token"
+CONTROL_ADDRESS="127.0.0.1:8790"
+install -d -m 0700 "${CONTROL_DIR}"
+if [ ! -s "${CONTROL_TOKEN_FILE}" ]; then
+    umask 077
+    python3 - "${CONTROL_TOKEN_FILE}" <<'PY'
+import secrets
+import sys
+
+with open(sys.argv[1], "w", encoding="utf-8") as token_file:
+    token_file.write(secrets.token_urlsafe(32) + "\n")
+PY
+fi
+chmod 0600 "${CONTROL_TOKEN_FILE}"
+
+ENV_FILE="/etc/default/aimilivpn"
+touch "${ENV_FILE}"
+chmod 0600 "${ENV_FILE}"
+sed -i '/^AIMILI_CONTROL_ADDRESS=/d;/^AIMILI_CONTROL_TOKEN_FILE=/d' "${ENV_FILE}"
+printf '%s\n' \
+    "AIMILI_CONTROL_ADDRESS=${CONTROL_ADDRESS}" \
+    "AIMILI_CONTROL_TOKEN_FILE=${CONTROL_TOKEN_FILE}" >> "${ENV_FILE}"
+
 # 5. Configure Service
 echo -e "\n${YELLOW}[3/4] 正在配置系统服务...${PLAIN}"
 if command -v systemctl >/dev/null 2>&1; then
@@ -184,6 +210,8 @@ command_args="${INSTALL_DIR}/vpngate_manager.py"
 command_background="yes"
 directory="${INSTALL_DIR}"
 pidfile="/run/aimilivpn.pid"
+export AIMILI_CONTROL_ADDRESS="${CONTROL_ADDRESS}"
+export AIMILI_CONTROL_TOKEN_FILE="${CONTROL_TOKEN_FILE}"
 
 depend() {
     need net

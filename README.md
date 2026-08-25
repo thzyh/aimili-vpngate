@@ -196,6 +196,17 @@ bash scripts/selfcheck_multiexit.sh
 | `SLOT_TABLE_BASE` | `200` | 多出口策略路由表基准 |
 | `EXIT_SLOTS_CHECK_INTERVAL` | `30` | 多出口体检/补齐间隔（秒） |
 | `OPENVPN_TUN_DNS` | `8.8.8.8,1.1.1.1` | 隧道内 DNS（逗号分隔，竞速） |
+| `AIMILI_CONTROL_ADDRESS` | `127.0.0.1:8790` | 供 Aimili Gateway 使用的版本化控制 API；只允许显式回环 IP |
+| `AIMILI_CONTROL_TOKEN_FILE` | `/etc/aimilivpn/control.token` | 控制 API Bearer Token 文件；安装时以 `0600` 权限生成且更新时不轮换 |
+
+#### Aimili Gateway 控制接口
+
+定制版会同时启动 `/control/v1` 控制接口，供同机的 Aimili Gateway 管理候选目录和多出口槽位。该接口与原生网页账户完全独立，默认只监听 `127.0.0.1:8790`，所有请求都要求独立 Bearer Token。
+
+- 不要把控制令牌写入命令行、日志、Git 或网页配置。
+- Gateway 使用其自身权限受限的令牌副本；生产部署时由部署流程安全复制，不通过浏览器传递。
+- 控制响应不包含 OpenVPN 配置正文、原生网页账户、Cookie 或令牌。
+- 若把 `AIMILI_CONTROL_ADDRESS` 改成非回环地址，服务会拒绝启动控制接口。
 
 ---
 
