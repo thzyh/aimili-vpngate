@@ -1,3 +1,5 @@
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -279,6 +281,34 @@ class ManagedSlotFacadeTests(unittest.TestCase):
 
         self.assertEqual(result, expected)
         self.assertEqual(switch.call_count, 2)
+
+    def test_managed_rotate_waits_for_a_busy_slot_supervisor(self):
+        manager.exit_slots_supervise_lock.acquire()
+        release = threading.Timer(0.05, manager.exit_slots_supervise_lock.release)
+        release.start()
+        try:
+            with (
+                mock.patch.object(manager, "get_exit_slot_config", return_value={"active": [0], "paused": [], "residential_only": False}),
+                mock.patch.object(manager, "set_slot_pin"),
+                mock.patch.object(manager, "current_slot_node_ids", return_value=set()),
+                mock.patch.object(manager, "per_slot_country", return_value="JP"),
+                mock.patch.object(manager, "per_slot_isp", return_value=""),
+                mock.patch.object(manager, "per_slot_type", return_value="datacenter"),
+                mock.patch.object(manager, "select_slot_nodes", return_value=[{"id": "jp-live", "ip": "198.51.100.40", "country": "Japan"}]),
+                mock.patch.object(manager, "tear_down_slot"),
+                mock.patch.object(manager, "bring_up_slot", return_value=True),
+                mock.patch.object(manager, "write_slots_state"),
+                mock.patch.object(manager, "managed_slot_snapshot", return_value={"ok": True, "slot": 0, "status": "up"}),
+            ):
+                started = time.monotonic()
+                result = manager.rotate_managed_slot(0)
+        finally:
+            release.cancel()
+            if manager.exit_slots_supervise_lock.locked():
+                manager.exit_slots_supervise_lock.release()
+
+        self.assertTrue(result["ok"])
+        self.assertGreaterEqual(time.monotonic() - started, 0.04)
 
 
 if __name__ == "__main__":

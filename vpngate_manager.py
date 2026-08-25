@@ -2555,14 +2555,19 @@ def supervise_exit_slots_once() -> None:
     finally:
         exit_slots_supervise_lock.release()
 
-def switch_slot_node(i: int) -> dict[str, Any]:
+def switch_slot_node(i: int, lock_timeout: float = 0) -> dict[str, Any]:
     """手动为某槽位切换到另一个住宅节点（运营商/IP 质量不满意时重摇）。"""
     cfg = get_exit_slot_config()
     if i not in cfg["active"]:
         return {"ok": False, "error": f"槽位 #{i} 不存在"}
     if i in cfg["paused"]:
         return {"ok": False, "error": f"槽位 #{i} 已停止，请先启动再换 IP"}
-    if not exit_slots_supervise_lock.acquire(blocking=False):
+    acquired = (
+        exit_slots_supervise_lock.acquire(timeout=lock_timeout)
+        if lock_timeout > 0
+        else exit_slots_supervise_lock.acquire(blocking=False)
+    )
+    if not acquired:
         return {"ok": False, "error": "供给器正忙，请稍后重试"}
     try:
         # 手动换 IP 视为放弃锁定，清除该槽 pin，确保按地区切到“不同”节点
@@ -2719,7 +2724,7 @@ def create_managed_slot(country: str, proxy_type: str) -> dict[str, Any]:
 
 def rotate_managed_slot(i: int) -> dict[str, Any]:
     for _ in range(MANAGED_SLOT_CANDIDATE_ATTEMPTS):
-        result = switch_slot_node(i)
+        result = switch_slot_node(i, lock_timeout=10)
         if result.get("ok"):
             return managed_slot_snapshot(i)
     return {"ok": False, "error_code": "slot_rotate_failed"}
