@@ -2180,6 +2180,64 @@ def per_slot_country(i: int) -> str:
     """返回某槽位的地区过滤：优先用该槽位单独设定，否则回退到全局设置。"""
     return get_slot_country_map().get(str(i), "") or get_exit_slot_config()["country"]
 
+def normalize_proxy_type(ip_type: Any) -> str:
+    """把节点探测类型收敛为 Gateway 对外公开的封闭类型。"""
+    value = str(ip_type or "").strip().lower()
+    if value in ("residential", "mobile"):
+        return "residential"
+    if value in ("datacenter", "hosting", "proxy"):
+        return "datacenter"
+    return ""
+
+def safe_candidate_snapshot() -> list[dict[str, Any]]:
+    """返回控制 API 可公开的候选字段，不携带 OpenVPN 配置。"""
+    fields = (
+        "id", "country_short", "country", "ip", "owner", "asn", "as_name",
+        "latency_ms", "score", "probe_status", "last_probe_at",
+    )
+    result: list[dict[str, Any]] = []
+    for node in read_nodes():
+        if node.get("probe_status") != "available":
+            continue
+        proxy_type = normalize_proxy_type(node.get("ip_type"))
+        item = {field: node.get(field) for field in fields}
+        item["proxy_type"] = proxy_type
+        result.append(item)
+    return result
+
+def get_slot_type_map() -> dict[str, str]:
+    cfg = load_ui_config()
+    raw = cfg.get("exit_slot_type_map") or {}
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        str(key): normalized
+        for key, value in raw.items()
+        if (normalized := normalize_proxy_type(value))
+    }
+
+def per_slot_type(i: int) -> str:
+    return get_slot_type_map().get(str(i), "")
+
+def set_slot_type(i: int, proxy_type: Any) -> dict[str, str]:
+    normalized = normalize_proxy_type(proxy_type)
+    if str(proxy_type or "").strip() and not normalized:
+        raise ValueError("出口类型只允许 residential 或 datacenter")
+    with lock:
+        auth_file = DATA_DIR / "ui_auth.json"
+        cfg = load_ui_config()
+        type_map = cfg.get("exit_slot_type_map")
+        if not isinstance(type_map, dict):
+            type_map = {}
+        if normalized:
+            type_map[str(i)] = normalized
+        else:
+            type_map.pop(str(i), None)
+        cfg["exit_slot_type_map"] = type_map
+        DATA_DIR.mkdir(exist_ok=True, parents=True)
+        auth_file.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    return get_slot_type_map()
+
 def get_slot_isp_map() -> dict[str, str]:
     cfg = load_ui_config()
     raw = cfg.get("exit_slot_isp_map") or {}
@@ -2271,14 +2329,23 @@ def pick_slot_node(i: int, used_ids: set[str]) -> dict[str, Any] | None:
         if node:
             return node
     cfg = get_exit_slot_config()
-    picks = select_slot_nodes(used_ids, 1, per_slot_country(i), cfg["residential_only"], per_slot_isp(i))
+    picks = select_slot_nodes(
+        used_ids, 1, per_slot_country(i), cfg["residential_only"],
+        per_slot_isp(i), per_slot_type(i),
+    )
     return picks[0] if picks else None
 
-def select_slot_nodes(used_ids: set[str], need: int, country: str, residential_only: bool, isp: str = "") -> list[dict[str, Any]]:
+def select_slot_nodes(
+    used_ids: set[str], need: int, country: str, residential_only: bool,
+    isp: str = "", proxy_type: str = "",
+) -> list[dict[str, Any]]:
     if need <= 0:
         return []
     countries = [c.strip() for c in country.split(",") if c.strip()] if country else []
     isp_kws = [k.strip().lower() for k in isp.split(",") if k.strip()] if isp else []
+    normalized_type = normalize_proxy_type(proxy_type)
+    if proxy_type and not normalized_type:
+        return []
     now = time.time()
     bad = {nid for nid, until in slot_bad_nodes.items() if until > now}
     pool: list[dict[str, Any]] = []
@@ -2288,6 +2355,8 @@ def select_slot_nodes(used_ids: set[str], need: int, country: str, residential_o
         if n.get("probe_status") != "available":
             continue
         if residential_only and n.get("ip_type") not in ("residential", "mobile"):
+            continue
+        if normalized_type and normalize_proxy_type(n.get("ip_type")) != normalized_type:
             continue
         if countries and str(n.get("country_short", "")).upper() not in countries:
             continue
@@ -2498,7 +2567,10 @@ def switch_slot_node(i: int) -> dict[str, Any]:
         set_slot_pin(i, "")
         # 当前节点已在 exit_slots 中，current_slot_node_ids() 会把它纳入排除集，确保切到不同 IP
         used = current_slot_node_ids()
-        picks = select_slot_nodes(used, 1, per_slot_country(i), cfg["residential_only"], per_slot_isp(i))
+        picks = select_slot_nodes(
+            used, 1, per_slot_country(i), cfg["residential_only"],
+            per_slot_isp(i), per_slot_type(i),
+        )
         if not picks:
             return {"ok": False, "error": "没有其他可用住宅节点可切换（可放宽地区/运营商过滤或稍后重试）"}
         tear_down_slot(i, stop_proxy=False)
