@@ -25,9 +25,12 @@ class FakeManager:
             }
         ]
 
-    def create_managed_slot(self, country, proxy_type):
-        self.created.append((country, proxy_type))
+    def create_managed_slot(self, country, proxy_type, candidate_id=""):
+        self.created.append((country, proxy_type, candidate_id))
         return {"slot": 2, "country": country, "proxy_type": proxy_type, "port": 17930, "status": "up"}
+
+    def managed_slots_snapshot(self):
+        return [self.managed_slot_snapshot(2)]
 
     def managed_slot_snapshot(self, slot):
         if slot != 2:
@@ -95,11 +98,20 @@ class ControlAPITests(unittest.TestCase):
 
     def test_create_slot_normalizes_country_and_preserves_closed_type(self):
         status, _, payload = self.request(
-            "POST", "/control/v1/slots", {"country": "jp", "proxyType": "datacenter"}
+            "POST",
+            "/control/v1/slots",
+            {"country": "jp", "proxyType": "datacenter", "candidateId": "node-safe"},
         )
         self.assertEqual(status, 201)
-        self.assertEqual(self.manager.created, [("JP", "datacenter")])
+        self.assertEqual(self.manager.created, [("JP", "datacenter", "node-safe")])
         self.assertEqual(payload["data"]["slot"], 2)
+
+    def test_slots_collection_returns_only_manager_safe_snapshots(self):
+        status, _, payload = self.request("GET", "/control/v1/slots")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["data"][0]["slot"], 2)
+        self.assertNotIn("process", json.dumps(payload))
 
     def test_create_slot_rejects_unknown_fields_before_calling_manager(self):
         status, _, payload = self.request(

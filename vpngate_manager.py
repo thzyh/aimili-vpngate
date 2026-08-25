@@ -2696,15 +2696,36 @@ def managed_slot_snapshot(i: int) -> dict[str, Any]:
         "checked_at": slot.get("egress_checked_at") or 0,
     }
 
-def create_managed_slot(country: str, proxy_type: str) -> dict[str, Any]:
+def managed_slots_snapshot() -> list[dict[str, Any]]:
+    """返回全部受管槽位的安全快照，供 Gateway 重启恢复使用。"""
+    with exit_slots_lock:
+        indices = sorted(exit_slots)
+    return [snapshot for i in indices if (snapshot := managed_slot_snapshot(i)).get("ok")]
+
+def create_managed_slot(country: str, proxy_type: str, candidate_id: str = "") -> dict[str, Any]:
     country = str(country or "").strip().upper()
     normalized_type = normalize_proxy_type(proxy_type)
     if not re.fullmatch(r"[A-Z]{2}", country) or not normalized_type:
         return {"ok": False, "error_code": "invalid_request"}
-    candidates = select_slot_nodes(
-        current_slot_node_ids(), MANAGED_SLOT_CANDIDATE_ATTEMPTS,
-        country, False, "", normalized_type,
-    )
+    candidate_id = str(candidate_id or "").strip()
+    used_ids = current_slot_node_ids()
+    if candidate_id:
+        candidate = next((node for node in read_nodes() if str(node.get("id") or "") == candidate_id), None)
+        if candidate is None or candidate.get("probe_status") != "available":
+            return {"ok": False, "error_code": "candidate_not_found"}
+        if (
+            str(candidate.get("country_short") or "").strip().upper() != country
+            or normalize_proxy_type(candidate.get("ip_type")) != normalized_type
+        ):
+            return {"ok": False, "error_code": "candidate_mismatch"}
+        if candidate_id in used_ids:
+            return {"ok": False, "error_code": "candidate_in_use"}
+        candidates = [candidate]
+    else:
+        candidates = select_slot_nodes(
+            used_ids, MANAGED_SLOT_CANDIDATE_ATTEMPTS,
+            country, False, "", normalized_type,
+        )
     if not candidates:
         return {"ok": False, "error_code": "no_matching_candidate"}
     for candidate in candidates:

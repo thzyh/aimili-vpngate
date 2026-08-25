@@ -117,16 +117,20 @@ class ControlHandler(BaseHTTPRequestHandler):
         if self.command == "GET" and path == f"{API_PREFIX}/candidates":
             self._manager_result(self.server.manager.safe_candidate_snapshot())
             return
+        if self.command == "GET" and path == f"{API_PREFIX}/slots":
+            self._manager_result(self.server.manager.managed_slots_snapshot())
+            return
         if self.command == "POST" and path == f"{API_PREFIX}/slots":
-            payload = self._read_object({"country", "proxyType"})
+            payload = self._read_object({"country", "proxyType", "candidateId"})
             country = str(payload.get("country") or "").strip().upper()
             proxy_type = str(payload.get("proxyType") or "").strip().lower()
+            candidate_id = str(payload.get("candidateId") or "").strip()
             if not re.fullmatch(r"[A-Z]{2}", country) or proxy_type not in (
                 "residential",
                 "datacenter",
-            ):
+            ) or len(candidate_id) > 256:
                 raise ValueError("invalid request")
-            result = self.server.manager.create_managed_slot(country, proxy_type)
+            result = self.server.manager.create_managed_slot(country, proxy_type, candidate_id)
             self._manager_result(result, HTTPStatus.CREATED)
             return
 

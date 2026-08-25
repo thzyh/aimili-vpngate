@@ -149,6 +149,60 @@ class ExitSlotTypeTests(unittest.TestCase):
 
 
 class ManagedSlotFacadeTests(unittest.TestCase):
+    def test_create_managed_slot_pins_the_requested_candidate(self):
+        candidates = [
+            {"id": "jp-fast", "country_short": "JP", "country": "Japan", "ip_type": "hosting", "probe_status": "available", "latency_ms": 1},
+            {"id": "jp-requested", "country_short": "JP", "country": "Japan", "ip_type": "hosting", "probe_status": "available", "latency_ms": 20},
+        ]
+        selected = []
+        runtime_slot = {
+            "slot": 3, "country_short": "JP", "country": "Japan", "ip_type": "hosting",
+            "port": 17931, "status": "up", "node_id": "jp-requested", "process": object(),
+        }
+        with (
+            mock.patch.object(manager, "read_nodes", return_value=candidates),
+            mock.patch.object(manager, "current_slot_node_ids", return_value=set()),
+            mock.patch.object(manager, "add_slot_with_node", side_effect=lambda node: selected.append(node) or {"ok": True, "slot": 3}),
+            mock.patch.object(manager, "set_slot_country"),
+            mock.patch.object(manager, "set_slot_type"),
+            mock.patch.object(manager, "get_slot_country_map", return_value={"3": "JP"}),
+            mock.patch.object(manager, "get_slot_type_map", return_value={"3": "datacenter"}),
+            mock.patch.object(manager, "exit_slots", {3: runtime_slot}),
+        ):
+            result = manager.create_managed_slot("JP", "datacenter", "jp-requested")
+
+        self.assertEqual(selected, ["jp-requested"])
+        self.assertEqual(result["node_id"], "jp-requested")
+
+    def test_create_managed_slot_rejects_requested_candidate_with_wrong_classification(self):
+        candidate = {
+            "id": "kr-home", "country_short": "KR", "country": "Korea",
+            "ip_type": "residential", "probe_status": "available",
+        }
+        with mock.patch.object(manager, "read_nodes", return_value=[candidate]):
+            result = manager.create_managed_slot("JP", "datacenter", "kr-home")
+
+        self.assertEqual(result, {"ok": False, "error_code": "candidate_mismatch"})
+
+    def test_managed_slots_snapshot_exposes_safe_runtime_fields_only(self):
+        runtime = {
+            1: {
+                "slot": 1, "country_short": "JP", "country": "Japan", "ip_type": "hosting",
+                "port": 17929, "status": "up", "node_id": "jp-one", "process": object(),
+                "config_text": "secret",
+            }
+        }
+        with (
+            mock.patch.object(manager, "exit_slots", runtime),
+            mock.patch.object(manager, "get_slot_country_map", return_value={"1": "JP"}),
+            mock.patch.object(manager, "get_slot_type_map", return_value={"1": "datacenter"}),
+        ):
+            snapshots = manager.managed_slots_snapshot()
+
+        self.assertEqual([item["slot"] for item in snapshots], [1])
+        self.assertNotIn("process", snapshots[0])
+        self.assertNotIn("config_text", snapshots[0])
+
     def test_start_control_plane_uses_explicit_loopback_configuration(self):
         sentinel = object()
         with (
