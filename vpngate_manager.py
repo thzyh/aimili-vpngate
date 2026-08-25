@@ -2331,9 +2331,10 @@ def pick_slot_node(i: int, used_ids: set[str]) -> dict[str, Any] | None:
         if node:
             return node
     cfg = get_exit_slot_config()
+    proxy_type = per_slot_type(i)
     picks = select_slot_nodes(
-        used_ids, 1, per_slot_country(i), cfg["residential_only"],
-        per_slot_isp(i), per_slot_type(i),
+        used_ids, 1, per_slot_country(i), cfg["residential_only"] and not proxy_type,
+        per_slot_isp(i), proxy_type,
     )
     return picks[0] if picks else None
 
@@ -2574,9 +2575,10 @@ def switch_slot_node(i: int, lock_timeout: float = 0) -> dict[str, Any]:
         set_slot_pin(i, "")
         # 当前节点已在 exit_slots 中，current_slot_node_ids() 会把它纳入排除集，确保切到不同 IP
         used = current_slot_node_ids()
+        proxy_type = per_slot_type(i)
         picks = select_slot_nodes(
-            used, 1, per_slot_country(i), cfg["residential_only"],
-            per_slot_isp(i), per_slot_type(i),
+            used, 1, per_slot_country(i), cfg["residential_only"] and not proxy_type,
+            per_slot_isp(i), proxy_type,
         )
         if not picks:
             return {"ok": False, "error": "没有其他可用住宅节点可切换（可放宽地区/运营商过滤或稍后重试）"}

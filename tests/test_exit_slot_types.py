@@ -83,7 +83,7 @@ class ExitSlotTypeTests(unittest.TestCase):
             {"id": "jp-dc", "country_short": "JP", "country": "Japan", "ip": "198.51.100.30", "ip_type": "hosting", "probe_status": "available", "latency_ms": 20, "score": 2},
         ]
         with (
-            mock.patch.object(manager, "get_exit_slot_config", return_value={"active": [0], "paused": [], "residential_only": False}),
+            mock.patch.object(manager, "get_exit_slot_config", return_value={"active": [0], "paused": [], "residential_only": True}),
             mock.patch.object(manager, "set_slot_pin"),
             mock.patch.object(manager, "current_slot_node_ids", return_value={"old-node"}),
             mock.patch.object(manager, "read_nodes", return_value=nodes),
@@ -98,6 +98,23 @@ class ExitSlotTypeTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["ip"], "198.51.100.30")
+
+    def test_supervisor_prefers_explicit_slot_type_over_global_residential_filter(self):
+        nodes = [
+            {"id": "jp-home", "country_short": "JP", "ip_type": "mobile", "probe_status": "available", "latency_ms": 1, "score": 9},
+            {"id": "jp-dc", "country_short": "JP", "ip_type": "hosting", "probe_status": "available", "latency_ms": 20, "score": 2},
+        ]
+        with (
+            mock.patch.object(manager, "get_slot_pin_map", return_value={}),
+            mock.patch.object(manager, "get_exit_slot_config", return_value={"residential_only": True}),
+            mock.patch.object(manager, "per_slot_country", return_value="JP"),
+            mock.patch.object(manager, "per_slot_isp", return_value=""),
+            mock.patch.object(manager, "per_slot_type", return_value="datacenter"),
+            mock.patch.object(manager, "read_nodes", return_value=nodes),
+        ):
+            selected = manager.pick_slot_node(0, set())
+
+        self.assertEqual(selected["id"], "jp-dc")
 
     def test_failed_rotate_candidate_enters_cooldown(self):
         candidate = {
