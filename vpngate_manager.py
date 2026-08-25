@@ -77,6 +77,7 @@ class DualStackHTTPServer(ThreadingHTTPServer):
 
 import vpn_utils
 import proxy_server
+import control_api
 import node_pool
 
 def env_int(name: str, default: int, min_value: int | None = None, max_value: int | None = None) -> int:
@@ -2659,6 +2660,85 @@ def check_slot_egress(port: int) -> tuple[bool, str]:
         except Exception:
             pass
     return False, ""
+
+def managed_slot_snapshot(i: int) -> dict[str, Any]:
+    """返回 Gateway 控制面需要的槽位安全快照。"""
+    with exit_slots_lock:
+        slot = dict(exit_slots.get(i) or {})
+    if not slot:
+        return {"ok": False, "error_code": "slot_not_found"}
+    return {
+        "ok": True,
+        "slot": i,
+        "country": str(get_slot_country_map().get(str(i)) or slot.get("country_short") or "").upper(),
+        "country_name": slot.get("country") or "",
+        "proxy_type": get_slot_type_map().get(str(i)) or normalize_proxy_type(slot.get("ip_type")),
+        "port": parse_int(slot.get("port")) or slot_port(i),
+        "status": slot.get("status") or "down",
+        "node_id": slot.get("node_id") or "",
+        "candidate_ip": slot.get("ip") or "",
+        "exit_ip": slot.get("exit_ip") or "",
+        "egress_ok": bool(slot.get("egress_ok")),
+        "latency_ms": parse_int(slot.get("latency_ms")),
+        "checked_at": slot.get("egress_checked_at") or 0,
+    }
+
+def create_managed_slot(country: str, proxy_type: str) -> dict[str, Any]:
+    country = str(country or "").strip().upper()
+    normalized_type = normalize_proxy_type(proxy_type)
+    if not re.fullmatch(r"[A-Z]{2}", country) or not normalized_type:
+        return {"ok": False, "error_code": "invalid_request"}
+    candidates = select_slot_nodes(
+        current_slot_node_ids(), 1, country, False, "", normalized_type
+    )
+    if not candidates:
+        return {"ok": False, "error_code": "no_matching_candidate"}
+    result = add_slot_with_node(str(candidates[0].get("id") or ""))
+    if not result.get("ok"):
+        return {"ok": False, "error_code": "slot_create_failed"}
+    slot = parse_int(result.get("slot"))
+    try:
+        set_slot_country(slot, country)
+        set_slot_type(slot, normalized_type)
+        return managed_slot_snapshot(slot)
+    except Exception:
+        delete_slot(slot)
+        return {"ok": False, "error_code": "slot_configuration_failed"}
+
+def rotate_managed_slot(i: int) -> dict[str, Any]:
+    result = switch_slot_node(i)
+    if not result.get("ok"):
+        return {"ok": False, "error_code": "slot_rotate_failed"}
+    return managed_slot_snapshot(i)
+
+def check_managed_slot(i: int) -> dict[str, Any]:
+    snapshot = managed_slot_snapshot(i)
+    if not snapshot.get("ok"):
+        return snapshot
+    ok, exit_ip = check_slot_egress(parse_int(snapshot.get("port")))
+    checked_at = time.time()
+    with exit_slots_lock:
+        slot = exit_slots.get(i)
+        if slot is not None:
+            slot["egress_ok"] = ok
+            slot["exit_ip"] = exit_ip
+            slot["egress_checked_at"] = checked_at
+    write_slots_state()
+    snapshot = managed_slot_snapshot(i)
+    snapshot["egress_ok"] = ok
+    snapshot["exit_ip"] = exit_ip
+    snapshot["checked_at"] = checked_at
+    return snapshot
+
+def delete_managed_slot(i: int) -> dict[str, Any]:
+    result = delete_slot(i)
+    if not result.get("ok"):
+        return {"ok": False, "error_code": "slot_not_found"}
+    set_slot_country(i, "")
+    set_slot_type(i, "")
+    set_slot_isp(i, "")
+    set_slot_pin(i, "")
+    return {"ok": True, "slot": i}
 
 def slot_egress_checker_loop() -> None:
     """周期对每个运行中的槽位做真实出口检测；节点'假活不转发'时标记并自动漂移到其他节点。"""
@@ -6964,6 +7044,16 @@ class Tee:
     def __getattr__(self, attr: str) -> Any:
         return getattr(self.stdout, attr)
 
+def start_control_plane() -> control_api.ControlHTTPServer:
+    address = os.environ.get("AIMILI_CONTROL_ADDRESS", "127.0.0.1:8790")
+    token_file = Path(
+        os.environ.get("AIMILI_CONTROL_TOKEN_FILE", "/etc/aimilivpn/control.token")
+    )
+    server = control_api.start_control_server(sys.modules[__name__], address, token_file)
+    print(f"Control API: http://{address}/control/v1/", flush=True)
+    return server
+
+
 def main() -> None:
     ensure_dirs()
     kill_existing_openvpn_processes()
@@ -7040,6 +7130,8 @@ def main() -> None:
     threading.Thread(target=active_node_pinger, daemon=True).start()
     threading.Thread(target=exit_slots_loop, daemon=True).start()
     threading.Thread(target=slot_egress_checker_loop, daemon=True).start()
+
+    start_control_plane()
     
     ui_cfg = load_ui_config()
     ui_host = ui_cfg.get("host", UI_HOST)
