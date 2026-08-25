@@ -97,6 +97,37 @@ class ExitSlotTypeTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["ip"], "198.51.100.30")
 
+    def test_failed_rotate_candidate_enters_cooldown(self):
+        candidate = {
+            "id": "jp-stale",
+            "country_short": "JP",
+            "country": "Japan",
+            "ip": "198.51.100.30",
+            "ip_type": "hosting",
+            "probe_status": "available",
+            "latency_ms": 20,
+            "score": 2,
+        }
+        bad_nodes = {}
+        with (
+            mock.patch.object(manager, "get_exit_slot_config", return_value={"active": [0], "paused": [], "residential_only": False}),
+            mock.patch.object(manager, "set_slot_pin"),
+            mock.patch.object(manager, "current_slot_node_ids", return_value={"old-node"}),
+            mock.patch.object(manager, "read_nodes", return_value=[candidate]),
+            mock.patch.object(manager, "per_slot_country", return_value="JP"),
+            mock.patch.object(manager, "per_slot_isp", return_value=""),
+            mock.patch.object(manager, "per_slot_type", return_value="datacenter"),
+            mock.patch.object(manager, "tear_down_slot"),
+            mock.patch.object(manager, "bring_up_slot", return_value=False),
+            mock.patch.object(manager, "mark_slot_pending"),
+            mock.patch.object(manager, "write_slots_state"),
+            mock.patch.object(manager, "slot_bad_nodes", bad_nodes),
+        ):
+            result = manager.switch_slot_node(0)
+
+        self.assertFalse(result["ok"])
+        self.assertIn("jp-stale", bad_nodes)
+
 
 class ManagedSlotFacadeTests(unittest.TestCase):
     def test_start_control_plane_uses_explicit_loopback_configuration(self):
@@ -172,6 +203,82 @@ class ManagedSlotFacadeTests(unittest.TestCase):
 
         self.assertEqual(result, {"ok": False, "error_code": "no_matching_candidate"})
         self.assertEqual(allocated, [])
+
+    def test_create_managed_slot_retries_the_next_matching_candidate(self):
+        candidates = [
+            {"id": "jp-stale", "country_short": "JP", "country": "Japan", "ip_type": "hosting", "probe_status": "available", "latency_ms": 1, "score": 9},
+            {"id": "jp-live", "country_short": "JP", "country": "Japan", "ip_type": "hosting", "probe_status": "available", "latency_ms": 2, "score": 8},
+        ]
+        runtime_slot = {
+            "slot": 0,
+            "country_short": "JP",
+            "country": "Japan",
+            "ip_type": "hosting",
+            "port": 17928,
+            "status": "up",
+            "node_id": "jp-live",
+            "process": object(),
+        }
+        selected = []
+        countries = {}
+        types = {}
+
+        def add(node_id):
+            selected.append(node_id)
+            if node_id == "jp-stale":
+                return {"ok": False, "error": "authentication failed"}
+            return {"ok": True, "slot": 0}
+
+        with (
+            mock.patch.object(manager, "read_nodes", return_value=candidates),
+            mock.patch.object(manager, "current_slot_node_ids", return_value=set()),
+            mock.patch.object(manager, "add_slot_with_node", side_effect=add),
+            mock.patch.object(manager, "set_slot_country", side_effect=lambda slot, value: countries.update({str(slot): value}) or countries.copy()),
+            mock.patch.object(manager, "set_slot_type", side_effect=lambda slot, value: types.update({str(slot): value}) or types.copy()),
+            mock.patch.object(manager, "get_slot_country_map", side_effect=lambda: countries.copy()),
+            mock.patch.object(manager, "get_slot_type_map", side_effect=lambda: types.copy()),
+            mock.patch.object(manager, "exit_slots", {0: runtime_slot}),
+            mock.patch.object(manager, "slot_bad_nodes", {}),
+        ):
+            result = manager.create_managed_slot("JP", "datacenter")
+
+        self.assertEqual(selected, ["jp-stale", "jp-live"])
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["node_id"], "jp-live")
+
+    def test_add_slot_with_node_rolls_back_allocation_when_dial_fails(self):
+        candidate = {"id": "jp-stale", "probe_status": "available"}
+        with (
+            mock.patch.object(manager, "read_nodes", return_value=[candidate]),
+            mock.patch.object(manager, "get_active_slots", return_value=[]),
+            mock.patch.object(manager, "load_ui_config", return_value={}),
+            mock.patch.object(manager, "_save_slot_lists"),
+            mock.patch.object(manager, "set_slot_pin"),
+            mock.patch.object(manager, "assign_node_to_slot", return_value={"ok": False, "error": "authentication failed"}),
+            mock.patch.object(manager, "delete_slot", return_value={"ok": True}) as delete,
+        ):
+            result = manager.add_slot_with_node("jp-stale")
+
+        self.assertFalse(result["ok"])
+        delete.assert_called_once_with(0)
+
+    def test_rotate_managed_slot_retries_after_a_stale_candidate(self):
+        expected = {"ok": True, "slot": 0, "node_id": "jp-live", "status": "up"}
+        with (
+            mock.patch.object(
+                manager,
+                "switch_slot_node",
+                side_effect=[
+                    {"ok": False, "error": "authentication failed"},
+                    {"ok": True, "ip": "198.51.100.40"},
+                ],
+            ) as switch,
+            mock.patch.object(manager, "managed_slot_snapshot", return_value=expected),
+        ):
+            result = manager.rotate_managed_slot(0)
+
+        self.assertEqual(result, expected)
+        self.assertEqual(switch.call_count, 2)
 
 
 if __name__ == "__main__":

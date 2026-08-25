@@ -138,6 +138,7 @@ EXIT_SLOTS_CHECK_INTERVAL = env_int("EXIT_SLOTS_CHECK_INTERVAL", 30, 5)
 SLOT_EGRESS_CHECK_INTERVAL = env_int("SLOT_EGRESS_CHECK_INTERVAL", 45, 10)
 SLOT_EGRESS_FAIL_THRESHOLD = env_int("SLOT_EGRESS_FAIL_THRESHOLD", 2, 1)
 SLOT_BAD_NODE_COOLDOWN = env_int("SLOT_BAD_NODE_COOLDOWN", 600, 60)
+MANAGED_SLOT_CANDIDATE_ATTEMPTS = 4
 # 主连接(7928)出口加固：与多出口槽位对齐。
 #   - 连续失败阈值：避免单次抖动即切换，减少无谓漂移。
 #   - 坏节点冷却：切走“握手成功但不转发”的假活节点后，冷却期内不再选回它，防止 flapping。
@@ -2578,6 +2579,9 @@ def switch_slot_node(i: int) -> dict[str, Any]:
         if bring_up_slot(i, picks[0]):
             write_slots_state()
             return {"ok": True, "ip": picks[0].get("ip"), "country": picks[0].get("country")}
+        failed_node_id = str(picks[0].get("id") or "")
+        if failed_node_id:
+            slot_bad_nodes[failed_node_id] = time.time() + SLOT_BAD_NODE_COOLDOWN
         mark_slot_pending(i, "手动切换后连接失败，待自动重试")
         write_slots_state()
         return {"ok": False, "error": f"切换到节点 {picks[0].get('id')} 失败，将自动重试"}
@@ -2644,6 +2648,8 @@ def add_slot_with_node(node_id: str) -> dict[str, Any]:
     result = assign_node_to_slot(new_idx, node_id)
     if result.get("ok"):
         result["message"] = f"已新增槽位 #{new_idx}（端口 {slot_port(new_idx)}）并锁定该节点"
+    else:
+        delete_slot(new_idx)
     return result
 
 def check_slot_egress(port: int) -> tuple[bool, str]:
@@ -2689,27 +2695,34 @@ def create_managed_slot(country: str, proxy_type: str) -> dict[str, Any]:
     if not re.fullmatch(r"[A-Z]{2}", country) or not normalized_type:
         return {"ok": False, "error_code": "invalid_request"}
     candidates = select_slot_nodes(
-        current_slot_node_ids(), 1, country, False, "", normalized_type
+        current_slot_node_ids(), MANAGED_SLOT_CANDIDATE_ATTEMPTS,
+        country, False, "", normalized_type,
     )
     if not candidates:
         return {"ok": False, "error_code": "no_matching_candidate"}
-    result = add_slot_with_node(str(candidates[0].get("id") or ""))
-    if not result.get("ok"):
-        return {"ok": False, "error_code": "slot_create_failed"}
-    slot = parse_int(result.get("slot"))
-    try:
-        set_slot_country(slot, country)
-        set_slot_type(slot, normalized_type)
-        return managed_slot_snapshot(slot)
-    except Exception:
-        delete_slot(slot)
-        return {"ok": False, "error_code": "slot_configuration_failed"}
+    for candidate in candidates:
+        node_id = str(candidate.get("id") or "")
+        result = add_slot_with_node(node_id)
+        if not result.get("ok"):
+            if node_id:
+                slot_bad_nodes[node_id] = time.time() + SLOT_BAD_NODE_COOLDOWN
+            continue
+        slot = parse_int(result.get("slot"))
+        try:
+            set_slot_country(slot, country)
+            set_slot_type(slot, normalized_type)
+            return managed_slot_snapshot(slot)
+        except Exception:
+            delete_slot(slot)
+            return {"ok": False, "error_code": "slot_configuration_failed"}
+    return {"ok": False, "error_code": "slot_create_failed"}
 
 def rotate_managed_slot(i: int) -> dict[str, Any]:
-    result = switch_slot_node(i)
-    if not result.get("ok"):
-        return {"ok": False, "error_code": "slot_rotate_failed"}
-    return managed_slot_snapshot(i)
+    for _ in range(MANAGED_SLOT_CANDIDATE_ATTEMPTS):
+        result = switch_slot_node(i)
+        if result.get("ok"):
+            return managed_slot_snapshot(i)
+    return {"ok": False, "error_code": "slot_rotate_failed"}
 
 def check_managed_slot(i: int) -> dict[str, Any]:
     snapshot = managed_slot_snapshot(i)
