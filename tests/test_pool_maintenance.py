@@ -16,6 +16,30 @@ def node(index, status="not_checked", active=False):
 
 
 class PoolMaintenanceTests(unittest.TestCase):
+    def test_collector_delays_boot_scan_and_backs_off_after_failure(self):
+        sleeps = []
+
+        class StopLoop(Exception):
+            pass
+
+        def record_sleep(seconds):
+            sleeps.append(seconds)
+            if len(sleeps) == 2:
+                raise StopLoop()
+
+        with (
+            mock.patch.object(manager, "COLLECTOR_INITIAL_DELAY_SECONDS", 120),
+            mock.patch.object(manager, "COLLECTOR_FAILURE_BACKOFF_SECONDS", 600),
+            mock.patch.object(manager, "maintain_valid_nodes", return_value="获取节点失败"),
+            mock.patch.object(manager, "active_openvpn_running", return_value=False),
+            mock.patch.object(manager, "log_to_json"),
+            mock.patch.object(manager.time, "sleep", side_effect=record_sleep),
+        ):
+            with self.assertRaises(StopLoop):
+                manager.collector_loop()
+
+        self.assertEqual(sleeps, [120, 600])
+
     def test_storage_sort_excludes_unavailable_and_untested_nodes(self):
         manager.active_openvpn_node_id = "live"
         try:

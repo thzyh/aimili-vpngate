@@ -119,6 +119,8 @@ PROBE_FAILURE_COOLDOWN_SECONDS = env_int("PROBE_FAILURE_COOLDOWN_SECONDS", 1800,
 OPENVPN_TEST_TIMEOUT_SECONDS = env_int("OPENVPN_TEST_TIMEOUT_SECONDS", 35, 1)
 OPENVPN_TEST_CONCURRENCY = env_int("OPENVPN_TEST_CONCURRENCY", 8, 1, 64)
 TCP_PRESCREEN_CONCURRENCY = env_int("TCP_PRESCREEN_CONCURRENCY", 100, 1, 512)
+COLLECTOR_INITIAL_DELAY_SECONDS = env_int("COLLECTOR_INITIAL_DELAY_SECONDS", 0, 0)
+COLLECTOR_FAILURE_BACKOFF_SECONDS = env_int("COLLECTOR_FAILURE_BACKOFF_SECONDS", 30, 30)
 
 # ---- 多出口（住宅 IP 槽位）配置 ----
 # 每个槽位 = 一条独立 OpenVPN 隧道(tun{DEV_BASE+i}) + 独立策略路由表({TABLE_BASE+i}) + 独立本地代理端口({PORT_BASE+i})
@@ -2839,6 +2841,8 @@ def exit_slots_loop() -> None:
 
 def collector_loop() -> None:
     global last_collector_heartbeat
+    if COLLECTOR_INITIAL_DELAY_SECONDS > 0:
+        time.sleep(COLLECTOR_INITIAL_DELAY_SECONDS)
     while True:
         last_collector_heartbeat = time.time()
         success = False
@@ -2846,8 +2850,7 @@ def collector_loop() -> None:
             print("[守护线程] 开始执行节点拉取与可用性检测周期任务...", flush=True)
             log_to_json("INFO", "Main", "开始执行节点拉取与可用性检测周期任务...")
             res = maintain_valid_nodes(force=False)
-            if "没有拉取到新节点" not in res:
-                success = True
+            success = res.startswith("Fetched ")
             log_to_json("INFO", "Main", f"周期同步与检测任务完成，结果: {res}")
         except Exception as exc:
             err_msg = f"周期节点同步任务执行异常: {exc}"
@@ -2856,7 +2859,7 @@ def collector_loop() -> None:
             set_state(last_check_at=time.time(), last_check_message=f"check error: {exc}")
             
         if not active_openvpn_running() and not success:
-            sleep_time = 30
+            sleep_time = COLLECTOR_FAILURE_BACKOFF_SECONDS
         else:
             sleep_time = CHECK_INTERVAL_SECONDS
             
