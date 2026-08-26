@@ -207,6 +207,7 @@ bash scripts/selfcheck_multiexit.sh
 - Gateway 使用其自身权限受限的令牌副本；生产部署时由部署流程安全复制，不通过浏览器传递。
 - 控制响应不包含 OpenVPN 配置正文、原生网页账户、Cookie 或令牌。
 - 若把 `AIMILI_CONTROL_ADDRESS` 改成非回环地址，服务会拒绝启动控制接口。
+- V1-C 部署可显式设置 `MAX_EXIT_SLOTS=64` 作为代码上限；低内存 VPS 必须从 1 开始阶梯扩容。该值不代表 VPNGate 当前一定存在相同数量的唯一可用出口，也不代表硬件能够稳定承载 64 条 OpenVPN 隧道。
 
 ---
 
