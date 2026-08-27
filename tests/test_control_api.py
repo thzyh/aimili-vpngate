@@ -12,6 +12,7 @@ class FakeManager:
     def __init__(self):
         self.created = []
         self.deleted = []
+        self.admin_updates = []
 
     def safe_candidate_snapshot(self):
         return [
@@ -46,6 +47,20 @@ class FakeManager:
     def delete_managed_slot(self, slot):
         self.deleted.append(slot)
         return {"ok": True, "slot": slot}
+
+    def managed_account_status(self):
+        return {"username": "owner", "totpSupported": False}
+
+    def update_managed_account(self, username, password):
+        self.admin_updates.append((username, password))
+        return {"ok": True}
+
+    def issue_managed_ui_session(self):
+        return {
+            "cookieName": "session",
+            "sessionToken": "opaque-session-token",
+            "expiresAt": 1_700_000_300,
+        }
 
 
 class ControlAPITests(unittest.TestCase):
@@ -87,7 +102,17 @@ class ControlAPITests(unittest.TestCase):
         self.assertEqual(payload["data"]["apiVersion"], "v1")
         self.assertEqual(
             payload["data"]["capabilities"],
-            ["candidates.read", "slots.create", "slots.read", "slots.rotate", "slots.check", "slots.delete"],
+            [
+                "candidates.read",
+                "slots.create",
+                "slots.read",
+                "slots.rotate",
+                "slots.check",
+                "slots.delete",
+                "admin.read",
+                "admin.update",
+                "admin.sessions.issue",
+            ],
         )
 
     def test_candidate_response_contains_only_manager_safe_snapshot(self):
@@ -146,6 +171,48 @@ class ControlAPITests(unittest.TestCase):
                 self.assertEqual(server.server_address[0], "127.0.0.1")
             finally:
                 server.server_close()
+
+    def test_admin_contract_updates_credentials_without_returning_secrets(self):
+        status, _, payload = self.request("GET", "/control/v1/admin")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, {"data": {"username": "owner", "totpSupported": False}})
+
+        status, _, payload = self.request(
+            "PUT",
+            "/control/v1/admin",
+            {"username": "renamed", "password": "new-password-marker"},
+        )
+        self.assertEqual(status, 204)
+        self.assertIsNone(payload)
+        self.assertEqual(self.manager.admin_updates, [("renamed", "new-password-marker")])
+
+    def test_admin_update_rejects_unknown_fields_before_calling_manager(self):
+        status, _, payload = self.request(
+            "PUT",
+            "/control/v1/admin",
+            {"username": "renamed", "password": "new-password-marker", "secret_path": "forbidden"},
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload, {"error": {"code": "invalid_request"}})
+        self.assertEqual(self.manager.admin_updates, [])
+
+    def test_admin_session_contract_returns_only_opaque_cookie_material(self):
+        status, headers, payload = self.request("POST", "/control/v1/admin/sessions", {})
+        self.assertEqual(status, 201)
+        self.assertEqual(
+            payload,
+            {
+                "data": {
+                    "cookieName": "session",
+                    "sessionToken": "opaque-session-token",
+                    "expiresAt": 1_700_000_300,
+                }
+            },
+        )
+        serialized = json.dumps(payload)
+        self.assertNotIn("password", serialized)
+        self.assertNotIn("secret_path", serialized)
+        self.assertNotIn("Set-Cookie", dict(headers))
 
 
 if __name__ == "__main__":

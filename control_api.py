@@ -22,6 +22,9 @@ CAPABILITIES = [
     "slots.rotate",
     "slots.check",
     "slots.delete",
+    "admin.read",
+    "admin.update",
+    "admin.sessions.issue",
 ]
 
 
@@ -117,6 +120,25 @@ class ControlHandler(BaseHTTPRequestHandler):
         if self.command == "GET" and path == f"{API_PREFIX}/candidates":
             self._manager_result(self.server.manager.safe_candidate_snapshot())
             return
+        if self.command == "GET" and path == f"{API_PREFIX}/admin":
+            self._manager_result(self.server.manager.managed_account_status())
+            return
+        if self.command == "PUT" and path == f"{API_PREFIX}/admin":
+            payload = self._read_object({"username", "password"})
+            username = str(payload.get("username") or "")
+            password = str(payload.get("password") or "")
+            result = self.server.manager.update_managed_account(username, password)
+            if isinstance(result, dict) and result.get("ok") is False:
+                self._manager_result(result)
+            else:
+                self._send_json(HTTPStatus.NO_CONTENT)
+            return
+        if self.command == "POST" and path == f"{API_PREFIX}/admin/sessions":
+            self._read_object(set())
+            self._manager_result(
+                self.server.manager.issue_managed_ui_session(), HTTPStatus.CREATED
+            )
+            return
         if self.command == "GET" and path == f"{API_PREFIX}/slots":
             self._manager_result(self.server.manager.managed_slots_snapshot())
             return
@@ -168,6 +190,7 @@ class ControlHandler(BaseHTTPRequestHandler):
 
     do_GET = _handle
     do_POST = _handle
+    do_PUT = _handle
     do_DELETE = _handle
 
 

@@ -8,6 +8,7 @@ import os
 import queue
 import re
 import select
+import secrets
 import shlex
 import signal
 import socket
@@ -312,6 +313,68 @@ def load_ui_config() -> dict[str, Any]:
                 pass
                 
         return config
+
+def managed_account_status() -> dict[str, Any]:
+    ui_cfg = load_ui_config()
+    return {
+        "username": str(ui_cfg.get("username") or ""),
+        "totpSupported": False,
+    }
+
+def _valid_managed_credentials(username: str, password: str) -> bool:
+    if not 1 <= len(username) <= 64 or username != username.strip():
+        return False
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in username):
+        return False
+    if not 12 <= len(password) <= 256 or password != password.strip():
+        return False
+    return not any(ord(character) < 0x20 or ord(character) == 0x7F for character in password)
+
+def _write_ui_config_atomic(config: dict[str, Any]) -> None:
+    DATA_DIR.mkdir(exist_ok=True, parents=True)
+    auth_file = DATA_DIR / "ui_auth.json"
+    temporary = auth_file.with_name(f".{auth_file.name}.{secrets.token_hex(8)}.tmp")
+    descriptor = -1
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as destination:
+            descriptor = -1
+            json.dump(config, destination, ensure_ascii=False, indent=2)
+            destination.write("\n")
+            destination.flush()
+            os.fsync(destination.fileno())
+        os.replace(temporary, auth_file)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+def update_managed_account(username: str, password: str) -> dict[str, Any]:
+    username = str(username or "")
+    password = str(password or "")
+    if not _valid_managed_credentials(username, password):
+        return {"ok": False, "error_code": "invalid_credentials"}
+    with lock:
+        ui_cfg = load_ui_config()
+        ui_cfg["username"] = username
+        ui_cfg["password"] = password
+        _write_ui_config_atomic(ui_cfg)
+        active_sessions.clear()
+    return {"ok": True}
+
+def issue_managed_ui_session() -> dict[str, Any]:
+    expires_at = time.time() + 300
+    token = secrets.token_urlsafe(32)
+    with lock:
+        active_sessions[token] = expires_at
+    return {
+        "cookieName": "session",
+        "sessionToken": token,
+        "expiresAt": expires_at,
+    }
 
 # 初始化时优先从 ui_auth.json 加载保存的代理出站端口和网页端口配置以覆盖环境变量
 try:
