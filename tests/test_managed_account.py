@@ -63,6 +63,16 @@ class ManagedAccountTests(unittest.TestCase):
                 self.assertEqual(result, {"ok": False, "error_code": "invalid_credentials"})
                 self.assertEqual(self.auth_file.read_bytes(), before)
 
+    def test_verify_compares_both_fields_without_returning_them(self):
+        self.assertEqual(
+            manager.verify_managed_account("owner", "old-password-marker"),
+            {"ok": True},
+        )
+        self.assertEqual(
+            manager.verify_managed_account("owner", "wrong-password-marker"),
+            {"ok": False, "error_code": "credentials_rejected"},
+        )
+
     def test_issued_session_is_opaque_and_expires_within_five_minutes(self):
         with mock.patch.object(manager.time, "time", return_value=1_700_000_000):
             result = manager.issue_managed_ui_session()

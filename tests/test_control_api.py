@@ -110,6 +110,7 @@ class ControlAPITests(unittest.TestCase):
                 "slots.check",
                 "slots.delete",
                 "admin.read",
+                "admin.verify",
                 "admin.update",
                 "admin.sessions.issue",
             ],
@@ -195,6 +196,19 @@ class ControlAPITests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertEqual(payload, {"error": {"code": "invalid_request"}})
         self.assertEqual(self.manager.admin_updates, [])
+
+    def test_admin_verify_returns_no_account_material(self):
+        self.manager.verify_managed_account = lambda username, password: {
+            "ok": username == "owner" and password == "old-password-marker",
+            **({} if username == "owner" and password == "old-password-marker" else {"error_code": "credentials_rejected"}),
+        }
+        status, _, payload = self.request(
+            "POST",
+            "/control/v1/admin/verify",
+            {"username": "owner", "password": "old-password-marker"},
+        )
+        self.assertEqual(status, 204)
+        self.assertIsNone(payload)
 
     def test_admin_session_contract_returns_only_opaque_cookie_material(self):
         status, headers, payload = self.request("POST", "/control/v1/admin/sessions", {})

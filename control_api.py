@@ -23,6 +23,7 @@ CAPABILITIES = [
     "slots.check",
     "slots.delete",
     "admin.read",
+    "admin.verify",
     "admin.update",
     "admin.sessions.issue",
 ]
@@ -128,6 +129,17 @@ class ControlHandler(BaseHTTPRequestHandler):
             username = str(payload.get("username") or "")
             password = str(payload.get("password") or "")
             result = self.server.manager.update_managed_account(username, password)
+            if isinstance(result, dict) and result.get("ok") is False:
+                self._manager_result(result)
+            else:
+                self._send_json(HTTPStatus.NO_CONTENT)
+            return
+        if self.command == "POST" and path == f"{API_PREFIX}/admin/verify":
+            payload = self._read_object({"username", "password"})
+            result = self.server.manager.verify_managed_account(
+                str(payload.get("username") or ""),
+                str(payload.get("password") or ""),
+            )
             if isinstance(result, dict) and result.get("ok") is False:
                 self._manager_result(result)
             else:

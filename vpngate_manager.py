@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import csv
+import hmac
 import json
 import os
 import queue
@@ -364,6 +365,16 @@ def update_managed_account(username: str, password: str) -> dict[str, Any]:
         _write_ui_config_atomic(ui_cfg)
         active_sessions.clear()
     return {"ok": True}
+
+def verify_managed_account(username: str, password: str) -> dict[str, Any]:
+    ui_cfg = load_ui_config()
+    expected_username = str(ui_cfg.get("username") or "")
+    expected_password = str(ui_cfg.get("password") or "")
+    username_matches = hmac.compare_digest(str(username or ""), expected_username)
+    password_matches = hmac.compare_digest(str(password or ""), expected_password)
+    if username_matches and password_matches:
+        return {"ok": True}
+    return {"ok": False, "error_code": "credentials_rejected"}
 
 def issue_managed_ui_session() -> dict[str, Any]:
     expires_at = time.time() + 300
