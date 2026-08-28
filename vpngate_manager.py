@@ -512,6 +512,21 @@ def get_state() -> dict[str, Any]:
     
     return state
 
+def safe_main_status() -> dict[str, Any]:
+    """Return the non-secret main tun0/7928 egress status for Gateway."""
+    state = get_state()
+    active_id = str(state.get("active_openvpn_node_id") or "")
+    active = next((node for node in read_nodes() if str(node.get("id") or "") == active_id), {})
+    return {
+        "country": str(active.get("country_short") or active.get("country") or "").upper() if active else "",
+        "country_name": str(active.get("country") or "") if active else "",
+        "proxy_type": str(active.get("proxy_type") or "") if active else "",
+        "exit_ip": str(state.get("proxy_ip") or "") if state.get("proxy_ok") else "",
+        "port": int(state.get("proxy_port") or LOCAL_PROXY_PORT),
+        "egress_ok": bool(state.get("proxy_ok")),
+        "active": bool(active_id) and not bool(state.get("is_connecting")),
+    }
+
 def safe_name(value: str) -> str:
     value = re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip())
     return value.strip("._") or "node"

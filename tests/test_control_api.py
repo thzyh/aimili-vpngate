@@ -28,6 +28,9 @@ class FakeManager:
             }
         ]
 
+    def safe_main_status(self):
+        return {"country": "JP", "country_name": "Japan", "proxy_type": "datacenter", "exit_ip": "203.0.113.20", "port": 7928, "egress_ok": True, "active": True}
+
     def country_catalog_snapshot(self):
         return [
             {"code": "JP", "name": "日本", "candidateCount": 8, "observedAt": 1_700_000_000}
@@ -138,12 +141,21 @@ class ControlAPITests(unittest.TestCase):
                 "slots.rotate",
                 "slots.check",
                 "slots.delete",
+                "main.read",
                 "admin.read",
                 "admin.verify",
                 "admin.update",
                 "admin.sessions.issue",
             ],
         )
+
+    def test_main_egress_returns_only_safe_status(self):
+        status, _, payload = self.request("GET", "/control/v1/main")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["data"]["port"], 7928)
+        serialized = json.dumps(payload).lower()
+        for forbidden in ["password", "token", "config", "process"]:
+            self.assertNotIn(forbidden, serialized)
 
     def test_country_catalog_and_refresh_use_a_closed_safe_contract(self):
         status, _, payload = self.request("GET", "/control/v1/candidates/countries")

@@ -25,6 +25,7 @@ CAPABILITIES = [
     "slots.rotate",
     "slots.check",
     "slots.delete",
+    "main.read",
     "admin.read",
     "admin.verify",
     "admin.update",
@@ -123,6 +124,9 @@ class ControlHandler(BaseHTTPRequestHandler):
             return
         if self.command == "GET" and path == f"{API_PREFIX}/candidates":
             self._manager_result(self.server.manager.safe_candidate_snapshot())
+            return
+        if self.command == "GET" and path == f"{API_PREFIX}/main":
+            self._manager_result(self.server.manager.safe_main_status())
             return
         if self.command == "GET" and path == f"{API_PREFIX}/candidates/countries":
             self._manager_result(self.server.manager.country_catalog_snapshot())
