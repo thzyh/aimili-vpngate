@@ -1,4 +1,5 @@
 import base64
+import time
 import unittest
 from unittest import mock
 
@@ -15,7 +16,116 @@ def node(index, status="not_checked", active=False):
     }
 
 
+def country_node(node_id, country, status="not_checked"):
+    return {
+        "id": node_id,
+        "country_short": country,
+        "country": country,
+        "probe_status": status,
+        "config_file": f"{node_id}.ovpn",
+        "config_text": f"remote {node_id}.invalid 443 tcp\n",
+    }
+
+
 class PoolMaintenanceTests(unittest.TestCase):
+    def test_country_refresh_runs_in_background_and_exposes_safe_status(self):
+        candidates = [country_node("jp-one", "JP")]
+        with (
+            mock.patch.object(manager, "read_nodes", return_value=[]),
+            mock.patch.object(manager, "fetch_candidates", return_value=candidates),
+            mock.patch.object(
+                manager,
+                "country_catalog_snapshot",
+                return_value=[
+                    {"code": "JP", "candidateCount": 1},
+                    {"code": "US", "candidateCount": 2},
+                ],
+            ),
+            mock.patch.object(manager, "current_slot_node_ids", return_value=set()),
+            mock.patch.object(
+                manager,
+                "probe_nodes",
+                side_effect=lambda batch: [dict(item, probe_status="available") for item in batch],
+            ),
+            mock.patch.object(manager, "load_blacklist", return_value={}),
+            mock.patch.object(manager, "write_json"),
+            mock.patch.object(manager, "set_state"),
+        ):
+            accepted = manager.start_country_refresh("jp")
+            deadline = time.time() + 2
+            snapshot = manager.country_refresh_snapshot()
+            while snapshot["state"] == "running" and time.time() < deadline:
+                time.sleep(0.01)
+                snapshot = manager.country_refresh_snapshot()
+
+        self.assertEqual(accepted["state"], "running")
+        self.assertEqual(snapshot["state"], "completed")
+        self.assertEqual(snapshot["country"], "JP")
+        self.assertEqual(snapshot["catalogCount"], 3)
+        self.assertEqual(snapshot["countryCandidateCount"], 1)
+        self.assertEqual(snapshot["testedCount"], 1)
+        self.assertNotIn("exception", snapshot)
+
+    def test_country_refresh_preserves_other_countries_and_managed_slots(self):
+        existing = [
+            country_node("jp-old", "JP", "available"),
+            country_node("jp-slot", "JP", "available"),
+            country_node("us-existing", "US", "available"),
+        ]
+        candidates = [country_node(f"jp-new-{index}", "JP") for index in range(8)]
+        stored_nodes = []
+
+        def probe(batch):
+            return [dict(item, probe_status="available") for item in batch]
+
+        def store(path, payload):
+            if path == manager.NODES_FILE:
+                stored_nodes[:] = payload
+
+        with (
+            mock.patch.object(manager, "read_nodes", return_value=existing),
+            mock.patch.object(manager, "fetch_candidates", return_value=candidates),
+            mock.patch.object(manager, "current_slot_node_ids", return_value={"jp-slot"}),
+            mock.patch.object(manager, "probe_nodes", side_effect=probe),
+            mock.patch.object(manager, "load_blacklist", return_value={}),
+            mock.patch.object(manager, "write_json", side_effect=store),
+            mock.patch.object(manager, "set_state"),
+        ):
+            result = manager.refresh_country_nodes("JP", target_size=5, max_probes=20)
+
+        self.assertEqual(result["state"], "completed")
+        self.assertEqual(result["testedCount"], 4)
+        self.assertEqual(result["validCount"], 5)
+        self.assertEqual(
+            [item["id"] for item in stored_nodes],
+            ["us-existing", "jp-slot", "jp-new-0", "jp-new-1", "jp-new-2", "jp-new-3"],
+        )
+
+    def test_country_refresh_stops_after_twenty_failed_real_probes(self):
+        candidates = [country_node(f"jp-{index}", "JP") for index in range(30)]
+
+        def fail(batch):
+            return [
+                dict(item, probe_status="unavailable", probe_message="dial_failed")
+                for item in batch
+            ]
+
+        with (
+            mock.patch.object(manager, "read_nodes", return_value=[]),
+            mock.patch.object(manager, "fetch_candidates", return_value=candidates),
+            mock.patch.object(manager, "current_slot_node_ids", return_value=set()),
+            mock.patch.object(manager, "probe_nodes", side_effect=fail),
+            mock.patch.object(manager, "load_blacklist", return_value={}),
+            mock.patch.object(manager, "write_json"),
+            mock.patch.object(manager, "set_state"),
+        ):
+            result = manager.refresh_country_nodes("JP", target_size=5, max_probes=20)
+
+        self.assertEqual(result["state"], "completed")
+        self.assertEqual(result["testedCount"], 20)
+        self.assertEqual(result["validCount"], 0)
+        self.assertEqual(result["stopReason"], "probe_limit_reached")
+
     def test_collector_delays_boot_scan_and_backs_off_after_failure(self):
         sleeps = []
 
@@ -157,7 +267,7 @@ class PoolMaintenanceTests(unittest.TestCase):
 
 class FetchCandidatesTests(unittest.TestCase):
     @staticmethod
-    def api_text(count):
+    def api_text(count, countries=None):
         header = (
             "#HostName,IP,CountryShort,CountryLong,Score,Ping,Speed,"
             "NumVpnSessions,OpenVPN_ConfigData_Base64"
@@ -165,11 +275,44 @@ class FetchCandidatesTests(unittest.TestCase):
         rows = []
         for index in range(count):
             ip = f"198.51.100.{index + 1}"
+            country = (countries or ["US"] * count)[index]
             config = base64.b64encode(
                 f"remote {ip} 443 tcp\nproto tcp\n".encode("utf-8")
             ).decode("ascii")
-            rows.append(f"host-{index},{ip},US,United States,100,10,1000,1,{config}")
+            country_long = "Japan" if country == "JP" else "United States"
+            rows.append(f"host-{index},{ip},{country},{country_long},100,10,1000,1,{config}")
         return "\n".join([header, *rows])
+
+    def test_country_fetch_filters_before_the_candidate_limit(self):
+        text = self.api_text(5, ["US", "US", "JP", "JP", "JP"])
+        with (
+            mock.patch.object(manager, "MAX_FETCH_ROWS", 2),
+            mock.patch.object(manager, "load_blacklist", return_value={}),
+            mock.patch.object(manager, "cached_nodes", return_value=[]),
+            mock.patch.object(manager, "fetch_api_text", return_value=text),
+            mock.patch.object(manager, "set_state"),
+            mock.patch.object(manager, "log_to_json"),
+            mock.patch.object(manager, "store_country_catalog"),
+        ):
+            candidates = manager.fetch_candidates("JP")
+
+        self.assertEqual([item["country_short"] for item in candidates], ["JP", "JP"])
+
+    def test_country_catalog_counts_raw_rows_without_node_secrets(self):
+        rows = manager.parse_vpngate_rows(
+            self.api_text(3, ["JP", "US", "JP"])
+        )
+
+        catalog = manager.build_country_catalog(rows, observed_at=100.0)
+
+        self.assertEqual(
+            catalog,
+            [
+                {"code": "JP", "name": "日本", "candidateCount": 2, "observedAt": 100.0},
+                {"code": "US", "name": "美国", "candidateCount": 1, "observedAt": 100.0},
+            ],
+        )
+        self.assertNotIn("OpenVPN_ConfigData_Base64", str(catalog))
 
     def test_fetch_reads_beyond_the_first_thirty_rows(self):
         with (

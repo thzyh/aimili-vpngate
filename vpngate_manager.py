@@ -167,9 +167,24 @@ AUTH_FILE = DATA_DIR / "vpngate_auth.txt"
 UPSTREAM_PROXY_AUTH_FILE = DATA_DIR / "upstream_proxy_auth.txt"
 BLACKLIST_FILE = DATA_DIR / "blacklist.json"
 SLOTS_FILE = DATA_DIR / "slots.json"
+COUNTRY_CATALOG_FILE = DATA_DIR / "country_catalog.json"
 
 lock = threading.RLock()
 maintenance_lock = threading.Lock()
+country_refresh_lock = threading.RLock()
+country_refresh_state: dict[str, Any] = {
+    "state": "idle",
+    "country": "",
+    "phase": "",
+    "catalogCount": 0,
+    "countryCandidateCount": 0,
+    "testedCount": 0,
+    "validCount": 0,
+    "preservedCount": 0,
+    "startedAt": 0.0,
+    "finishedAt": 0.0,
+    "errorCode": "",
+}
 active_sessions: dict[str, float] = {}
 active_openvpn_process: subprocess.Popen[str] | None = None
 active_openvpn_node_id = ""
@@ -776,6 +791,52 @@ def parse_vpngate_rows(text: str) -> list[dict[str, str]]:
         lines[0] = lines[0][1:]
     return list(csv.DictReader(lines))
 
+
+def build_country_catalog(
+    rows: list[dict[str, str]], observed_at: float | None = None
+) -> list[dict[str, Any]]:
+    """从原始目录生成不含节点配置的国家统计。"""
+    timestamp = time.time() if observed_at is None else observed_at
+    counts: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        code = str(row.get("CountryShort") or "").strip().upper()
+        if not re.fullmatch(r"[A-Z]{2}", code):
+            continue
+        country_long = str(row.get("CountryLong") or "").strip()
+        name = vpn_utils.COUNTRY_TRANSLATIONS.get(country_long, country_long or code)
+        item = counts.setdefault(
+            code,
+            {"code": code, "name": name, "candidateCount": 0, "observedAt": timestamp},
+        )
+        item["candidateCount"] += 1
+    return [counts[code] for code in sorted(counts)]
+
+
+def store_country_catalog(rows: list[dict[str, str]]) -> None:
+    write_json(COUNTRY_CATALOG_FILE, build_country_catalog(rows))
+
+
+def country_catalog_snapshot() -> list[dict[str, Any]]:
+    raw = read_json(COUNTRY_CATALOG_FILE, [])
+    if not isinstance(raw, list):
+        return []
+    result: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        code = str(item.get("code") or "").strip().upper()
+        if not re.fullmatch(r"[A-Z]{2}", code):
+            continue
+        result.append(
+            {
+                "code": code,
+                "name": str(item.get("name") or code),
+                "candidateCount": max(0, parse_int(item.get("candidateCount"))),
+                "observedAt": float(item.get("observedAt") or 0),
+            }
+        )
+    return result
+
 def decode_config(encoded: str) -> str:
     return base64.b64decode(encoded.encode("ascii"), validate=False).decode("utf-8", errors="replace")
 
@@ -852,7 +913,7 @@ def row_to_node(row: dict[str, str], config_text: str) -> dict[str, Any]:
         "probed_at": 0,
     }
 
-def fetch_candidates() -> list[dict[str, Any]]:
+def fetch_candidates(country: str = "") -> list[dict[str, Any]]:
     blacklist = load_blacklist()
     candidates: list[dict[str, Any]] = []
     seen_ips = set()
@@ -883,6 +944,13 @@ def fetch_candidates() -> list[dict[str, Any]]:
                 log_to_json("INFO", "Main", msg)
                 api_text = fetch_api_text(url, verify_ssl)
                 rows = parse_vpngate_rows(api_text)
+                try:
+                    store_country_catalog(rows)
+                except OSError as catalog_error:
+                    log_to_json("WARNING", "Main", f"保存国家目录失败: {catalog_error}")
+                normalized_country = str(country or "").strip().upper()
+                if normalized_country:
+                    rows = node_pool.filter_country_rows(rows, normalized_country)
                 fetch_succeeded = True
                 for row in rows:
                     if len(candidates) >= MAX_FETCH_ROWS:
@@ -1644,6 +1712,212 @@ def replenish_valid_pool(
         "batches": batch_count,
         "stop_reason": "target_reached",
     }
+
+
+def country_refresh_snapshot() -> dict[str, Any]:
+    with country_refresh_lock:
+        return dict(country_refresh_state)
+
+
+def _set_country_refresh(**updates: Any) -> dict[str, Any]:
+    with country_refresh_lock:
+        country_refresh_state.update(updates)
+        return dict(country_refresh_state)
+
+
+def _country_refresh_worker(country: str) -> None:
+    try:
+        result = refresh_country_nodes(country, _lock_held=True)
+        _set_country_refresh(
+            **result,
+            phase="",
+            finishedAt=time.time(),
+            errorCode="",
+        )
+    except Exception:
+        _set_country_refresh(
+            state="failed",
+            phase="",
+            finishedAt=time.time(),
+            errorCode="refresh_failed",
+        )
+
+
+def start_country_refresh(country: str) -> dict[str, Any]:
+    normalized_country = str(country or "").strip().upper()
+    if not re.fullmatch(r"[A-Z]{2}", normalized_country):
+        return {"state": "failed", "country": normalized_country, "errorCode": "invalid_country"}
+    if not maintenance_lock.acquire(blocking=False):
+        return {"state": "failed", "country": normalized_country, "errorCode": "maintenance_busy"}
+    accepted = _set_country_refresh(
+        state="running",
+        country=normalized_country,
+        phase="fetching",
+        catalogCount=0,
+        countryCandidateCount=0,
+        testedCount=0,
+        validCount=0,
+        preservedCount=0,
+        startedAt=time.time(),
+        finishedAt=0.0,
+        errorCode="",
+    )
+    try:
+        threading.Thread(
+            target=_country_refresh_worker,
+            args=(normalized_country,),
+            name=f"country-refresh-{normalized_country}",
+            daemon=True,
+        ).start()
+    except Exception:
+        maintenance_lock.release()
+        return _set_country_refresh(
+            state="failed",
+            phase="",
+            finishedAt=time.time(),
+            errorCode="worker_start_failed",
+        )
+    return accepted
+
+
+def refresh_country_nodes(
+    country: str,
+    target_size: int = 5,
+    max_probes: int = 20,
+    _lock_held: bool = False,
+) -> dict[str, Any]:
+    """串行补充单个国家的节点，并原子合并回全局有效池。"""
+    normalized_country = str(country or "").strip().upper()
+    if not re.fullmatch(r"[A-Z]{2}", normalized_country):
+        return {"state": "failed", "country": normalized_country, "errorCode": "invalid_country"}
+    if not _lock_held and not maintenance_lock.acquire(blocking=False):
+        return {"state": "failed", "country": normalized_country, "errorCode": "maintenance_busy"}
+
+    try:
+        existing_nodes = read_nodes()
+        candidates = fetch_candidates(normalized_country)
+        catalog_count = sum(
+            max(0, parse_int(item.get("candidateCount")))
+            for item in country_catalog_snapshot()
+        )
+        if _lock_held:
+            _set_country_refresh(
+                phase="probing",
+                catalogCount=catalog_count,
+                countryCandidateCount=len(candidates),
+            )
+        protected_ids = node_pool.protected_node_ids(
+            active_openvpn_node_id,
+            list(current_slot_node_ids()),
+        )
+        protected_country_nodes = [
+            item
+            for item in existing_nodes
+            if str(item.get("country_short") or "").strip().upper() == normalized_country
+            and str(item.get("id") or "").strip() in protected_ids
+        ]
+        preferred_ids = {
+            str(item.get("id") or "").strip()
+            for item in existing_nodes
+            if str(item.get("country_short") or "").strip().upper() == normalized_country
+            and item.get("probe_status") == "available"
+            and str(item.get("id") or "").strip() not in protected_ids
+        }
+        blacklist = load_blacklist()
+        tested_ids: set[str] = set()
+        selected = list(protected_country_nodes)
+        tested_count = 0
+        stop_reason = "target_reached"
+
+        while len(selected) < target_size and tested_count < max_probes:
+            queue = node_pool.candidate_queue(
+                candidates,
+                selected,
+                blacklist,
+                tested_ids,
+                time.time(),
+                preferred_ids,
+            )
+            if not queue:
+                stop_reason = "candidates_exhausted"
+                break
+            remaining = max_probes - tested_count
+            needed = target_size - len(selected)
+            batch = queue[: min(NODE_TEST_BATCH_SIZE, remaining, needed)]
+            batch_ids = {str(item.get("id") or "").strip() for item in batch}
+            tested_ids.update(batch_ids)
+            results = list(probe_nodes(batch) or [])
+            returned_ids = {str(item.get("id") or "").strip() for item in results}
+            for item in batch:
+                node_id = str(item.get("id") or "").strip()
+                if node_id not in returned_ids:
+                    results.append(
+                        {
+                            **item,
+                            "probe_status": "unavailable",
+                            "probe_message": "节点探测未返回结果",
+                            "probed_at": time.time(),
+                        }
+                    )
+            tested_count += len(batch)
+            if _lock_held:
+                _set_country_refresh(testedCount=tested_count)
+            selected, failed = node_pool.merge_probe_results(selected, results, target_size)
+            for item in failed:
+                node_id = str(item.get("id") or "").strip()
+                if not node_id:
+                    continue
+                blacklist[node_id] = {
+                    "id": node_id,
+                    "ip": item.get("ip") or item.get("remote_host") or "",
+                    "country": item.get("country", ""),
+                    "reason": item.get("probe_message") or "OpenVPN 节点验证失败",
+                    "marked_at": time.time(),
+                    "until": time.time() + PROBE_FAILURE_COOLDOWN_SECONDS,
+                }
+
+        if len(selected) < target_size and tested_count >= max_probes:
+            stop_reason = "probe_limit_reached"
+
+        if _lock_held:
+            _set_country_refresh(phase="merging")
+        merged = node_pool.merge_country_pool(
+            existing_nodes,
+            selected,
+            normalized_country,
+            protected_ids,
+            target_size,
+        )
+        for item in merged:
+            config_file = str(item.get("config_file") or "")
+            config_text = str(item.get("config_text") or "")
+            if not config_file or not config_text:
+                continue
+            config_path = Path(config_file)
+            if config_path.is_absolute() and not config_path.exists():
+                config_path.write_text(config_text, encoding="utf-8")
+        write_json(BLACKLIST_FILE, blacklist)
+        write_json(NODES_FILE, merged)
+        valid_count = sum(
+            1
+            for item in merged
+            if str(item.get("country_short") or "").strip().upper() == normalized_country
+            and item.get("probe_status") == "available"
+        )
+        result = {
+            "state": "completed",
+            "country": normalized_country,
+            "catalogCount": catalog_count,
+            "countryCandidateCount": len(candidates),
+            "testedCount": tested_count,
+            "validCount": valid_count,
+            "preservedCount": len(protected_country_nodes),
+            "stopReason": stop_reason,
+        }
+        set_state(last_check_at=time.time(), last_check_message=f"国家 {normalized_country} 节点刷新完成")
+        return result
+    finally:
+        maintenance_lock.release()
 
 def mark_main_bad_node(node_id: str) -> None:
     """把主连接出口不通的节点加入冷却名单，冷却期内 auto_switch_node 不会再选回它。"""
