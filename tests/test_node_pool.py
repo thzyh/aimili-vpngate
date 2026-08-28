@@ -1,6 +1,13 @@
 import unittest
 
-from node_pool import candidate_queue, merge_probe_results, protected_active_nodes
+from node_pool import (
+    candidate_queue,
+    filter_country_rows,
+    merge_country_pool,
+    merge_probe_results,
+    protected_active_nodes,
+    protected_node_ids,
+)
 
 
 def node(node_id, status="not_checked", active=False):
@@ -8,6 +15,49 @@ def node(node_id, status="not_checked", active=False):
 
 
 class NodePoolTests(unittest.TestCase):
+    def test_country_filter_runs_on_raw_rows_without_global_truncation(self):
+        rows = [
+            {"IP": "192.0.2.1", "CountryShort": "US"},
+            {"IP": "192.0.2.2", "CountryShort": "jp"},
+            {"IP": "192.0.2.3", "CountryShort": "JP"},
+        ]
+
+        self.assertEqual(
+            [row["IP"] for row in filter_country_rows(rows, "JP")],
+            ["192.0.2.2", "192.0.2.3"],
+        )
+
+    def test_protected_node_ids_include_main_and_every_managed_slot(self):
+        self.assertEqual(
+            protected_node_ids("main-node", ["slot-2", "", "slot-1", "slot-2"]),
+            {"main-node", "slot-1", "slot-2"},
+        )
+
+    def test_country_merge_preserves_other_countries_and_protected_nodes(self):
+        existing = [
+            {**node("jp-old", "available"), "country_short": "JP"},
+            {**node("jp-active", "unavailable"), "country_short": "JP"},
+            {**node("us-existing", "available"), "country_short": "US"},
+        ]
+        refreshed = [
+            {**node("jp-new", "available"), "country_short": "JP"},
+            {**node("jp-new", "available"), "country_short": "JP"},
+            {**node("jp-dead", "unavailable"), "country_short": "JP"},
+        ]
+
+        merged = merge_country_pool(
+            existing,
+            refreshed,
+            "JP",
+            {"jp-active"},
+            target_size=5,
+        )
+
+        self.assertEqual(
+            [item["id"] for item in merged],
+            ["us-existing", "jp-active", "jp-new"],
+        )
+
     def test_protects_only_the_current_active_node(self):
         existing = [
             node("good", "available"),

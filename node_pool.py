@@ -12,6 +12,71 @@ def _node_id(node: Node) -> str:
     return str(node.get("id") or "").strip()
 
 
+def filter_country_rows(rows: list[Node], country: str) -> list[Node]:
+    """从原始 VPNGate 行中稳定筛出指定国家。"""
+    wanted = str(country or "").strip().upper()
+    return [
+        row
+        for row in rows
+        if str(row.get("CountryShort") or "").strip().upper() == wanted
+    ]
+
+
+def protected_node_ids(active_node_id: str, slot_node_ids: list[str]) -> set[str]:
+    """返回目录刷新时不能删除的主连接和受管槽位节点 ID。"""
+    result = {
+        str(node_id or "").strip()
+        for node_id in [active_node_id, *slot_node_ids]
+    }
+    result.discard("")
+    return result
+
+
+def merge_country_pool(
+    existing_nodes: list[Node],
+    refreshed_nodes: list[Node],
+    country: str,
+    protected_ids: set[str],
+    target_size: int,
+) -> list[Node]:
+    """只替换一个国家的有效节点，同时保留其他国家和活动节点。"""
+    wanted = str(country or "").strip().upper()
+    protected = {str(node_id or "").strip() for node_id in protected_ids}
+    merged: list[Node] = []
+    seen: set[str] = set()
+
+    def append(node: Node) -> bool:
+        node_id = _node_id(node)
+        if not node_id or node_id in seen:
+            return False
+        merged.append(node)
+        seen.add(node_id)
+        return True
+
+    for node in existing_nodes:
+        node_country = str(node.get("country_short") or "").strip().upper()
+        if node_country != wanted:
+            append(node)
+
+    selected_count = 0
+    for node in existing_nodes:
+        node_id = _node_id(node)
+        node_country = str(node.get("country_short") or "").strip().upper()
+        if node_country == wanted and node_id in protected and append(node):
+            selected_count += 1
+
+    for node in refreshed_nodes:
+        if selected_count >= target_size:
+            break
+        node_country = str(node.get("country_short") or "").strip().upper()
+        if node_country != wanted or node.get("probe_status") != "available":
+            continue
+        if append(node):
+            selected_count += 1
+
+    return merged
+
+
 def protected_active_nodes(existing_nodes: list[Node], active_node_id: str) -> list[Node]:
     """返回补池期间必须保护的当前活动节点，最多一个。"""
     active_node_id = str(active_node_id or "").strip()
