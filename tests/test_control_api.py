@@ -13,6 +13,8 @@ class FakeManager:
         self.created = []
         self.deleted = []
         self.admin_updates = []
+        self.country_refreshes = []
+        self.refresh_start_result = {"state": "running", "country": "JP", "testedCount": 0}
 
     def safe_candidate_snapshot(self):
         return [
@@ -25,6 +27,30 @@ class FakeManager:
                 "probe_status": "available",
             }
         ]
+
+    def country_catalog_snapshot(self):
+        return [
+            {"code": "JP", "name": "日本", "candidateCount": 8, "observedAt": 1_700_000_000}
+        ]
+
+    def start_country_refresh(self, country):
+        self.country_refreshes.append(country)
+        return dict(self.refresh_start_result, country=country)
+
+    def country_refresh_snapshot(self):
+        return {
+            "state": "completed",
+            "country": "JP",
+            "phase": "",
+            "catalogCount": 20,
+            "countryCandidateCount": 8,
+            "testedCount": 5,
+            "validCount": 4,
+            "preservedCount": 1,
+            "startedAt": 1_700_000_000,
+            "finishedAt": 1_700_000_010,
+            "errorCode": "",
+        }
 
     def create_managed_slot(self, country, proxy_type, candidate_id=""):
         self.created.append((country, proxy_type, candidate_id))
@@ -104,6 +130,9 @@ class ControlAPITests(unittest.TestCase):
             payload["data"]["capabilities"],
             [
                 "candidates.read",
+                "candidate-countries.read",
+                "candidates.refresh.country",
+                "candidates.refresh.status",
                 "slots.create",
                 "slots.read",
                 "slots.rotate",
@@ -115,6 +144,47 @@ class ControlAPITests(unittest.TestCase):
                 "admin.sessions.issue",
             ],
         )
+
+    def test_country_catalog_and_refresh_use_a_closed_safe_contract(self):
+        status, _, payload = self.request("GET", "/control/v1/candidates/countries")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["data"][0]["code"], "JP")
+        self.assertNotIn("config", json.dumps(payload).lower())
+
+        status, _, payload = self.request(
+            "POST", "/control/v1/candidates/refresh", {"country": "jp"}
+        )
+        self.assertEqual(status, 202)
+        self.assertEqual(self.manager.country_refreshes, ["JP"])
+        self.assertEqual(payload["data"]["state"], "running")
+
+        status, _, payload = self.request("GET", "/control/v1/candidates/refresh")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["data"]["testedCount"], 5)
+        serialized = json.dumps(payload).lower()
+        for forbidden in ["password", "token", "config", "exception"]:
+            self.assertNotIn(forbidden, serialized)
+
+    def test_country_refresh_rejects_unknown_fields_and_maps_busy(self):
+        status, _, payload = self.request(
+            "POST",
+            "/control/v1/candidates/refresh",
+            {"country": "JP", "config": "must-not-pass"},
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload, {"error": {"code": "invalid_request"}})
+        self.assertEqual(self.manager.country_refreshes, [])
+
+        self.manager.refresh_start_result = {
+            "state": "failed",
+            "country": "JP",
+            "errorCode": "maintenance_busy",
+        }
+        status, _, payload = self.request(
+            "POST", "/control/v1/candidates/refresh", {"country": "JP"}
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(payload, {"error": {"code": "maintenance_busy"}})
 
     def test_candidate_response_contains_only_manager_safe_snapshot(self):
         status, _, payload = self.request("GET", "/control/v1/candidates")

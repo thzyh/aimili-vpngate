@@ -17,6 +17,9 @@ API_PREFIX = "/control/v1"
 MAX_REQUEST_BYTES = 16 * 1024
 CAPABILITIES = [
     "candidates.read",
+    "candidate-countries.read",
+    "candidates.refresh.country",
+    "candidates.refresh.status",
     "slots.create",
     "slots.read",
     "slots.rotate",
@@ -120,6 +123,29 @@ class ControlHandler(BaseHTTPRequestHandler):
             return
         if self.command == "GET" and path == f"{API_PREFIX}/candidates":
             self._manager_result(self.server.manager.safe_candidate_snapshot())
+            return
+        if self.command == "GET" and path == f"{API_PREFIX}/candidates/countries":
+            self._manager_result(self.server.manager.country_catalog_snapshot())
+            return
+        if self.command == "GET" and path == f"{API_PREFIX}/candidates/refresh":
+            self._manager_result(self.server.manager.country_refresh_snapshot())
+            return
+        if self.command == "POST" and path == f"{API_PREFIX}/candidates/refresh":
+            payload = self._read_object({"country"})
+            country = str(payload.get("country") or "").strip().upper()
+            if not re.fullmatch(r"[A-Z]{2}", country):
+                raise ValueError("invalid request")
+            result = self.server.manager.start_country_refresh(country)
+            if isinstance(result, dict) and result.get("state") == "failed":
+                code = str(result.get("errorCode") or "refresh_failed")
+                if code == "maintenance_busy":
+                    self._error(HTTPStatus.CONFLICT, code)
+                elif code == "invalid_country":
+                    self._error(HTTPStatus.BAD_REQUEST, code)
+                else:
+                    self._error(HTTPStatus.INTERNAL_SERVER_ERROR, "refresh_failed")
+                return
+            self._manager_result(result, HTTPStatus.ACCEPTED)
             return
         if self.command == "GET" and path == f"{API_PREFIX}/admin":
             self._manager_result(self.server.manager.managed_account_status())

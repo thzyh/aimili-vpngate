@@ -203,6 +203,13 @@ bash scripts/selfcheck_multiexit.sh
 
 定制版会同时启动 `/control/v1` 控制接口，供同机的 Aimili Gateway 管理候选目录和多出口槽位。该接口与原生网页账户完全独立，默认只监听 `127.0.0.1:8790`，所有请求都要求独立 Bearer Token。
 
+国家级刷新由 AimiliVPN 在后台执行，Gateway 只负责发起和读取脱敏状态：
+
+- `GET /control/v1/candidates/countries` 返回最近一次 VPNGate 快照中的国家代码、名称、候选数量和观察时间。
+- `POST /control/v1/candidates/refresh` 接受 `{"country":"JP"}`，只刷新指定国家；任务已受理时返回 `202`，与全局维护冲突时返回 `409`。
+- `GET /control/v1/candidates/refresh` 返回 `idle`、`running`、`completed` 或 `failed` 状态以及计数和稳定错误码。
+- 单国刷新目标为 5 个有效节点，最多精验 20 个候选，OpenVPN 精验并发保持 1；其他国家、主连接和受管槽位正在使用的节点不会被删除。
+
 - 不要把控制令牌写入命令行、日志、Git 或网页配置。
 - Gateway 使用其自身权限受限的令牌副本；生产部署时由部署流程安全复制，不通过浏览器传递。
 - 控制响应不包含 OpenVPN 配置正文、原生网页账户、Cookie 或令牌。
