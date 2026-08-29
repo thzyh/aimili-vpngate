@@ -81,6 +81,7 @@ import vpn_utils
 import proxy_server
 import control_api
 import node_pool
+from main_assignment import MainAssignmentCoordinator
 
 def env_int(name: str, default: int, min_value: int | None = None, max_value: int | None = None) -> int:
     raw = os.environ.get(name)
@@ -168,6 +169,7 @@ UPSTREAM_PROXY_AUTH_FILE = DATA_DIR / "upstream_proxy_auth.txt"
 BLACKLIST_FILE = DATA_DIR / "blacklist.json"
 SLOTS_FILE = DATA_DIR / "slots.json"
 COUNTRY_CATALOG_FILE = DATA_DIR / "country_catalog.json"
+MAIN_ASSIGNMENT_FILE = DATA_DIR / "main_assignment.json"
 
 lock = threading.RLock()
 maintenance_lock = threading.Lock()
@@ -195,6 +197,8 @@ last_active_latency = 0
 main_egress_fail_count = 0                       # 出口连续失败计数，达到 MAIN_EGRESS_FAIL_THRESHOLD 才切换
 main_bad_nodes: dict[str, float] = {}            # node_id -> 冷却到期时间（出口不通的坏节点，暂时排除）
 main_proxy_registry = proxy_server.ConnRegistry()  # 主代理活跃下游连接登记，切换成功后强制下游重连
+main_assignment_coordinator = MainAssignmentCoordinator(MAIN_ASSIGNMENT_FILE)
+main_assignment_thread = threading.local()
 
 last_collector_heartbeat = 0.0
 last_checker_heartbeat = 0.0
@@ -515,9 +519,10 @@ def get_state() -> dict[str, Any]:
 def safe_main_status() -> dict[str, Any]:
     """Return the non-secret main tun0/7928 egress status for Gateway."""
     state = get_state()
-    active_id = str(state.get("active_openvpn_node_id") or "")
+    active_id = str(active_openvpn_node_id or state.get("active_openvpn_node_id") or "")
     active = next((node for node in read_nodes() if str(node.get("id") or "") == active_id), {})
     return {
+        "candidate_id": active_id,
         "country": str(active.get("country_short") or active.get("country") or "").upper() if active else "",
         "country_name": str(active.get("country") or "") if active else "",
         "proxy_type": str(active.get("proxy_type") or "") if active else "",
@@ -526,6 +531,168 @@ def safe_main_status() -> dict[str, Any]:
         "egress_ok": bool(state.get("proxy_ok")),
         "active": bool(active_id) and not bool(state.get("is_connecting")),
     }
+
+
+def main_assignment_snapshot() -> dict[str, Any]:
+    """返回不含节点配置与认证材料的主切换状态。"""
+    return main_assignment_coordinator.snapshot()
+
+
+def main_mutation_allowed() -> bool:
+    return main_assignment_coordinator.mutation_allowed()
+
+
+def _main_connection_snapshot() -> dict[str, Any]:
+    active_id = str(active_openvpn_node_id or "").strip()
+    active = next(
+        (item for item in read_nodes() if str(item.get("id") or "").strip() == active_id),
+        {},
+    )
+    ui_cfg = load_ui_config()
+    return {
+        "candidate_id": active_id,
+        "country": str(active.get("country_short") or "").strip().upper(),
+        "proxy_type": normalize_proxy_type(active.get("ip_type")),
+        "connection_enabled": bool(ui_cfg.get("connection_enabled", True)),
+        "routing_mode": str(ui_cfg.get("routing_mode") or "auto"),
+        "routing_ip_type": str(ui_cfg.get("routing_ip_type") or "all"),
+        "fixed_node_id": str(ui_cfg.get("fixed_node_id") or ""),
+    }
+
+
+def _main_validation() -> dict[str, bool]:
+    result = check_proxy_health()
+    proxy_ok = result.get("ok") is True
+    return {
+        # check_proxy_health 使用 socks5h 请求域名，成功同时证明代理 DNS 和真实出口。
+        "dns_verified": proxy_ok,
+        "exit_verified": proxy_ok and bool(str(result.get("ip") or "").strip()),
+        "available": proxy_ok and active_openvpn_running(),
+    }
+
+
+def _stage_main_candidate(candidate_id: str) -> dict[str, bool]:
+    main_assignment_thread.authorized = True
+    try:
+        connect_node(candidate_id)
+        return _main_validation()
+    finally:
+        main_assignment_thread.authorized = False
+
+
+def _restore_main_candidate(previous: dict[str, Any]) -> dict[str, bool]:
+    previous_id = str(previous.get("candidate_id") or "").strip()
+    if not previous_id:
+        return {"dns_verified": False, "exit_verified": False, "available": False}
+    ui_cfg = load_ui_config()
+    for key in (
+        "connection_enabled",
+        "routing_mode",
+        "routing_ip_type",
+        "fixed_node_id",
+    ):
+        if key in previous:
+            ui_cfg[key] = previous[key]
+    _write_ui_config_atomic(ui_cfg)
+    main_assignment_thread.authorized = True
+    try:
+        connect_node(previous_id)
+        return _main_validation()
+    finally:
+        main_assignment_thread.authorized = False
+
+
+def _stage_main_assignment_unlocked(
+    candidate_id: str,
+    country: str,
+    proxy_type: str,
+    expected_current_candidate_id: str,
+    idempotency_key: str,
+) -> dict[str, Any]:
+    candidate_id = str(candidate_id or "").strip()
+    country = str(country or "").strip().upper()
+    proxy_type = normalize_proxy_type(proxy_type)
+    expected = str(expected_current_candidate_id or "").strip()
+    idempotency_key = str(idempotency_key or "").strip()
+    if (
+        not candidate_id
+        or len(candidate_id) > 256
+        or not re.fullmatch(r"[A-Z]{2}", country)
+        or not proxy_type
+        or not expected
+        or not 8 <= len(idempotency_key) <= 256
+    ):
+        return {"ok": False, "error_code": "invalid_request"}
+    candidate = next(
+        (item for item in read_nodes() if str(item.get("id") or "").strip() == candidate_id),
+        None,
+    )
+    if candidate is None:
+        return {"ok": False, "error_code": "candidate_not_found"}
+    if candidate.get("probe_status") != "available":
+        return {"ok": False, "error_code": "candidate_unavailable"}
+    if (
+        str(candidate.get("country_short") or "").strip().upper() != country
+        or normalize_proxy_type(candidate.get("ip_type")) != proxy_type
+    ):
+        return {"ok": False, "error_code": "candidate_mismatch"}
+    return main_assignment_coordinator.stage(
+        candidate_id=candidate_id,
+        country=country,
+        proxy_type=proxy_type,
+        expected_current_candidate_id=expected,
+        idempotency_key=idempotency_key,
+        current=_main_connection_snapshot(),
+        slot_candidate_ids=current_slot_node_ids(),
+        stage_candidate=_stage_main_candidate,
+        restore_previous=_restore_main_candidate,
+    )
+
+
+def stage_main_assignment(
+    candidate_id: str,
+    country: str,
+    proxy_type: str,
+    expected_current_candidate_id: str,
+    idempotency_key: str,
+) -> dict[str, Any]:
+    if not maintenance_lock.acquire(blocking=False):
+        return {"ok": False, "error_code": "operation_busy"}
+    if not exit_slots_supervise_lock.acquire(blocking=False):
+        maintenance_lock.release()
+        return {"ok": False, "error_code": "operation_busy"}
+    try:
+        return _stage_main_assignment_unlocked(
+            candidate_id,
+            country,
+            proxy_type,
+            expected_current_candidate_id,
+            idempotency_key,
+        )
+    finally:
+        exit_slots_supervise_lock.release()
+        maintenance_lock.release()
+
+
+def commit_main_assignment(operation_id: str) -> dict[str, Any]:
+    return main_assignment_coordinator.commit(str(operation_id or "").strip())
+
+
+def rollback_main_assignment(operation_id: str) -> dict[str, Any]:
+    return main_assignment_coordinator.rollback(
+        str(operation_id or "").strip(),
+        _restore_main_candidate,
+    )
+
+
+def recover_main_assignment() -> dict[str, Any]:
+    return main_assignment_coordinator.recover(_restore_main_candidate)
+
+
+def main_assignment_recovery_loop() -> None:
+    while True:
+        recover_main_assignment()
+        time.sleep(5)
 
 def safe_name(value: str) -> str:
     value = re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip())
@@ -1762,6 +1929,8 @@ def start_country_refresh(country: str) -> dict[str, Any]:
     normalized_country = str(country or "").strip().upper()
     if not re.fullmatch(r"[A-Z]{2}", normalized_country):
         return {"state": "failed", "country": normalized_country, "errorCode": "invalid_country"}
+    if not main_mutation_allowed():
+        return {"state": "failed", "country": normalized_country, "errorCode": "operation_busy"}
     if not maintenance_lock.acquire(blocking=False):
         return {"state": "failed", "country": normalized_country, "errorCode": "maintenance_busy"}
     accepted = _set_country_refresh(
@@ -1805,6 +1974,8 @@ def refresh_country_nodes(
     normalized_country = str(country or "").strip().upper()
     if not re.fullmatch(r"[A-Z]{2}", normalized_country):
         return {"state": "failed", "country": normalized_country, "errorCode": "invalid_country"}
+    if not main_mutation_allowed():
+        return {"state": "failed", "country": normalized_country, "errorCode": "operation_busy"}
     if not _lock_held and not maintenance_lock.acquire(blocking=False):
         return {"state": "failed", "country": normalized_country, "errorCode": "maintenance_busy"}
 
@@ -1825,6 +1996,7 @@ def refresh_country_nodes(
             active_openvpn_node_id,
             list(current_slot_node_ids()),
         )
+        protected_ids.update(main_assignment_coordinator.reserved_candidate_ids())
         protected_country_nodes = [
             item
             for item in existing_nodes
@@ -1961,6 +2133,8 @@ def reset_main_proxy_connections() -> None:
         print(f"[主代理] 重置下游连接异常: {e}", flush=True)
 
 def auto_switch_node(attempt: int = 0) -> None:
+    if not main_mutation_allowed():
+        return
     if attempt >= 3:
         print("[自动切换] 连续切换失败已达 3 次，停止切换以防止主线程死锁，将在后台重新加载节点...", flush=True)
         return
@@ -2062,6 +2236,8 @@ def auto_switch_node(attempt: int = 0) -> None:
 
 def connect_node(node_id: str) -> str:
     global active_openvpn_process, active_openvpn_node_id, is_connecting
+    if not main_mutation_allowed() and not bool(getattr(main_assignment_thread, "authorized", False)):
+        raise RuntimeError("主连接事务正在进行，请稍后再试")
     node_id = str(node_id or "").strip()
     if not node_id:
         raise ValueError("Node id is required")
@@ -2188,6 +2364,8 @@ def connect_node(node_id: str) -> str:
 
 def maintain_valid_nodes(force: bool = False) -> str:
     global active_openvpn_process, active_openvpn_node_id, is_connecting
+    if not main_mutation_allowed():
+        return "operation_busy"
     ensure_dirs()
     if not maintenance_lock.acquire(blocking=False):
         msg = "节点维护任务正在运行，请稍后再试"
@@ -2462,6 +2640,8 @@ def get_exit_slot_config() -> dict[str, Any]:
     }
 
 def set_exit_slot_config(count: Any = None, country: Any = None, residential_only: Any = None, isp: Any = None) -> dict[str, Any]:
+    if not main_mutation_allowed():
+        return {"ok": False, "error_code": "operation_busy"}
     with lock:
         cfg = load_ui_config()
         active = paused = None
@@ -2483,6 +2663,8 @@ def set_exit_slot_config(count: Any = None, country: Any = None, residential_onl
 
 def add_one_slot() -> dict[str, Any]:
     """新增一个空槽位：取最小可用索引加入启用列表。"""
+    if not main_mutation_allowed():
+        return {"ok": False, "error_code": "operation_busy"}
     with lock:
         active = get_active_slots()
         if len(active) >= MAX_EXIT_SLOTS:
@@ -2498,6 +2680,8 @@ def add_one_slot() -> dict[str, Any]:
 
 def delete_slot(i: int) -> dict[str, Any]:
     """删除某槽位：拆除隧道/代理并从启用列表移除，同时清理该槽的锁定/地区/暂停记录。"""
+    if not main_mutation_allowed():
+        return {"ok": False, "error_code": "operation_busy"}
     with lock:
         active = get_active_slots()
         if i not in active:
@@ -2513,6 +2697,8 @@ def delete_slot(i: int) -> dict[str, Any]:
     return {"ok": True, "slot": i, "message": f"已删除槽位 #{i}"}
 
 def stop_slot(i: int) -> dict[str, Any]:
+    if not main_mutation_allowed():
+        return {"ok": False, "error_code": "operation_busy"}
     with lock:
         active = get_active_slots()
         if i not in active:
@@ -2526,6 +2712,8 @@ def stop_slot(i: int) -> dict[str, Any]:
     return {"ok": True, "slot": i, "message": f"已停止槽位 #{i}"}
 
 def start_slot(i: int) -> dict[str, Any]:
+    if not main_mutation_allowed():
+        return {"ok": False, "error_code": "operation_busy"}
     with lock:
         active = get_active_slots()
         if i not in active:
@@ -2562,9 +2750,18 @@ def safe_candidate_snapshot() -> list[dict[str, Any]]:
         "id", "country_short", "country", "ip", "owner", "asn", "as_name",
         "latency_ms", "score", "probe_status", "last_probe_at",
     )
+    reserved = (
+        {str(active_openvpn_node_id or "").strip()}
+        | current_slot_node_ids()
+        | main_assignment_coordinator.reserved_candidate_ids()
+    )
+    reserved.discard("")
     result: list[dict[str, Any]] = []
     for node in read_nodes():
-        if node.get("probe_status") != "available":
+        if (
+            node.get("probe_status") != "available"
+            or str(node.get("id") or "").strip() in reserved
+        ):
             continue
         proxy_type = normalize_proxy_type(node.get("ip_type"))
         item = {field: node.get(field) for field in fields}
@@ -2881,6 +3078,8 @@ def build_3xui_outbounds() -> dict[str, Any]:
     }
 
 def supervise_exit_slots_once() -> None:
+    if not main_mutation_allowed():
+        return
     # 非阻塞互斥：周期线程与 API 触发线程可能并发，避免对同一槽位重复拨号/累加路由规则
     if not exit_slots_supervise_lock.acquire(blocking=False):
         return
@@ -2923,6 +3122,8 @@ def supervise_exit_slots_once() -> None:
 
 def switch_slot_node(i: int, lock_timeout: float = 0) -> dict[str, Any]:
     """手动为某槽位切换到另一个住宅节点（运营商/IP 质量不满意时重摇）。"""
+    if not main_mutation_allowed():
+        return {"ok": False, "error_code": "operation_busy"}
     cfg = get_exit_slot_config()
     if i not in cfg["active"]:
         return {"ok": False, "error": f"槽位 #{i} 不存在"}
@@ -2962,6 +3163,8 @@ def switch_slot_node(i: int, lock_timeout: float = 0) -> dict[str, Any]:
 
 def assign_node_to_slot(i: int, node_id: str) -> dict[str, Any]:
     """把指定节点(IP)分配到某个已存在的槽位并锁定，立即拨号。"""
+    if not main_mutation_allowed():
+        return {"ok": False, "error_code": "operation_busy"}
     cfg = get_exit_slot_config()
     if i not in cfg["active"]:
         return {"ok": False, "error": f"槽位 #{i} 不存在"}
@@ -2996,6 +3199,8 @@ def assign_node_to_slot(i: int, node_id: str) -> dict[str, Any]:
 
 def add_slot_with_node(node_id: str) -> dict[str, Any]:
     """新增一个槽位并锁定到指定节点(IP)。"""
+    if not main_mutation_allowed():
+        return {"ok": False, "error_code": "operation_busy"}
     node_id = str(node_id or "").strip()
     node = next((n for n in read_nodes() if n.get("id") == node_id), None)
     if not node:
@@ -3069,6 +3274,8 @@ def managed_slots_snapshot() -> list[dict[str, Any]]:
 
 def assign_managed_slot(i: int, node_id: str, country: str = "", proxy_type: str = "") -> dict[str, Any]:
     """将一个可用候选装载到指定受管槽位，并在失败时恢复原节点和筛选元数据。"""
+    if not main_mutation_allowed():
+        return {"ok": False, "error_code": "operation_busy"}
     try:
         slot = int(i)
     except (TypeError, ValueError):
@@ -3114,6 +3321,8 @@ def assign_managed_slot(i: int, node_id: str, country: str = "", proxy_type: str
     return {"ok": False, "error_code": "assign_failed"}
 
 def create_managed_slot(country: str, proxy_type: str, candidate_id: str = "") -> dict[str, Any]:
+    if not main_mutation_allowed():
+        return {"ok": False, "error_code": "operation_busy"}
     country = str(country or "").strip().upper()
     normalized_type = normalize_proxy_type(proxy_type)
     if not re.fullmatch(r"[A-Z]{2}", country) or not normalized_type:
@@ -3157,6 +3366,8 @@ def create_managed_slot(country: str, proxy_type: str, candidate_id: str = "") -
     return {"ok": False, "error_code": "slot_create_failed"}
 
 def rotate_managed_slot(i: int) -> dict[str, Any]:
+    if not main_mutation_allowed():
+        return {"ok": False, "error_code": "operation_busy"}
     for _ in range(MANAGED_SLOT_CANDIDATE_ATTEMPTS):
         result = switch_slot_node(i, lock_timeout=10)
         if result.get("ok"):
@@ -3183,6 +3394,8 @@ def check_managed_slot(i: int) -> dict[str, Any]:
     return snapshot
 
 def delete_managed_slot(i: int) -> dict[str, Any]:
+    if not main_mutation_allowed():
+        return {"ok": False, "error_code": "operation_busy"}
     result = delete_slot(i)
     if not result.get("ok"):
         return {"ok": False, "error_code": "slot_not_found"}
@@ -7578,6 +7791,8 @@ def main() -> None:
     else:
         print("[警告] 代理网关启动超时，继续执行脚本...", flush=True)
 
+    # 主事务恢复必须先于其他会改变节点/槽位的后台任务启动。
+    threading.Thread(target=main_assignment_recovery_loop, daemon=True).start()
     threading.Thread(target=collector_loop, daemon=True).start()
     threading.Thread(target=background_proxy_checker, daemon=True).start()
     threading.Thread(target=active_node_pinger, daemon=True).start()
