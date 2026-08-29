@@ -257,6 +257,27 @@ class ControlAPITests(unittest.TestCase):
         )
         self.assertEqual(status, 404)
 
+    def test_main_assignment_read_exposes_repair_state_as_data(self):
+        self.manager.main_assignment_result = {
+            "ok": False,
+            "operation_id": "operation-safe-1",
+            "state": "repair_required",
+            "old_candidate_id": "old-main",
+            "new_candidate_id": "node-safe",
+            "port": 7928,
+            "dns_verified": False,
+            "exit_verified": False,
+            "available": False,
+            "error_code": "rollback_failed",
+            "expires_at": 1_700_000_180,
+        }
+
+        status, _, payload = self.request("GET", "/control/v1/main/assignment")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["data"]["state"], "repair_required")
+        self.assertNotIn("ok", payload["data"])
+
     def test_country_catalog_and_refresh_use_a_closed_safe_contract(self):
         status, _, payload = self.request("GET", "/control/v1/candidates/countries")
         self.assertEqual(status, 200)

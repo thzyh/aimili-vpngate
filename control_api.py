@@ -151,7 +151,13 @@ class ControlHandler(BaseHTTPRequestHandler):
             self._manager_result(self.server.manager.safe_main_status())
             return
         if self.command == "GET" and path == f"{API_PREFIX}/main/assignment":
-            self._manager_result(self.server.manager.main_assignment_snapshot())
+            result = self.server.manager.main_assignment_snapshot()
+            if not isinstance(result, dict):
+                self._error(HTTPStatus.INTERNAL_SERVER_ERROR, "invalid_response")
+                return
+            result = dict(result)
+            result.pop("ok", None)
+            self._send_json(HTTPStatus.OK, {"data": result})
             return
         if self.command == "POST" and path == f"{API_PREFIX}/main/assign":
             payload = self._read_object(
