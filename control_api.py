@@ -27,6 +27,10 @@ CAPABILITIES = [
     "slots.assign",
     "slots.delete",
     "main.read",
+    "main.assignment.read",
+    "main.assign",
+    "main.assign.commit",
+    "main.assign.rollback",
     "admin.read",
     "admin.verify",
     "admin.update",
@@ -100,10 +104,27 @@ class ControlHandler(BaseHTTPRequestHandler):
             return None
         return int(match.group(1)), match.group(2) or ""
 
+    @staticmethod
+    def _main_assignment_action(path: str) -> tuple[str, str] | None:
+        match = re.fullmatch(
+            r"/control/v1/main/assign/([A-Za-z0-9_-]{8,128})/(commit|rollback)",
+            path,
+        )
+        if not match:
+            return None
+        return match.group(1), match.group(2)
+
     def _manager_result(self, result: Any, success: HTTPStatus = HTTPStatus.OK) -> None:
         if isinstance(result, dict) and result.get("ok") is False:
             code = str(result.get("error_code") or "operation_failed")
-            status = HTTPStatus.NOT_FOUND if code == "slot_not_found" else HTTPStatus.CONFLICT
+            if code in ("slot_not_found", "candidate_not_found", "operation_not_found"):
+                status = HTTPStatus.NOT_FOUND
+            elif code in ("invalid_request", "candidate_mismatch"):
+                status = HTTPStatus.BAD_REQUEST
+            elif code == "rollback_failed":
+                status = HTTPStatus.SERVICE_UNAVAILABLE
+            else:
+                status = HTTPStatus.CONFLICT
             self._error(status, code)
             return
         if isinstance(result, dict):
@@ -129,6 +150,55 @@ class ControlHandler(BaseHTTPRequestHandler):
         if self.command == "GET" and path == f"{API_PREFIX}/main":
             self._manager_result(self.server.manager.safe_main_status())
             return
+        if self.command == "GET" and path == f"{API_PREFIX}/main/assignment":
+            self._manager_result(self.server.manager.main_assignment_snapshot())
+            return
+        if self.command == "POST" and path == f"{API_PREFIX}/main/assign":
+            payload = self._read_object(
+                {
+                    "candidateId",
+                    "country",
+                    "proxyType",
+                    "expectedCurrentCandidateId",
+                    "idempotencyKey",
+                }
+            )
+            candidate_id = str(payload.get("candidateId") or "").strip()
+            country = str(payload.get("country") or "").strip().upper()
+            proxy_type = str(payload.get("proxyType") or "").strip().lower()
+            expected = str(payload.get("expectedCurrentCandidateId") or "").strip()
+            idempotency_key = str(payload.get("idempotencyKey") or "").strip()
+            if (
+                not candidate_id
+                or len(candidate_id) > 256
+                or not re.fullmatch(r"[A-Z]{2}", country)
+                or proxy_type not in ("residential", "datacenter")
+                or not expected
+                or len(expected) > 256
+                or not 8 <= len(idempotency_key) <= 256
+                or any(ord(character) < 0x21 or ord(character) == 0x7F for character in idempotency_key)
+            ):
+                raise ValueError("invalid request")
+            result = self.server.manager.stage_main_assignment(
+                candidate_id,
+                country,
+                proxy_type,
+                expected,
+                idempotency_key,
+            )
+            self._manager_result(result, HTTPStatus.ACCEPTED)
+            return
+        main_action = self._main_assignment_action(path)
+        if self.command == "POST" and main_action:
+            self._read_object(set())
+            operation_id, action = main_action
+            method = (
+                self.server.manager.commit_main_assignment
+                if action == "commit"
+                else self.server.manager.rollback_main_assignment
+            )
+            self._manager_result(method(operation_id))
+            return
         if self.command == "GET" and path == f"{API_PREFIX}/candidates/countries":
             self._manager_result(self.server.manager.country_catalog_snapshot())
             return
@@ -143,7 +213,7 @@ class ControlHandler(BaseHTTPRequestHandler):
             result = self.server.manager.start_country_refresh(country)
             if isinstance(result, dict) and result.get("state") == "failed":
                 code = str(result.get("errorCode") or "refresh_failed")
-                if code == "maintenance_busy":
+                if code in ("maintenance_busy", "operation_busy"):
                     self._error(HTTPStatus.CONFLICT, code)
                 elif code == "invalid_country":
                     self._error(HTTPStatus.BAD_REQUEST, code)

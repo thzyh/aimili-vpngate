@@ -14,6 +14,23 @@ class FakeManager:
         self.deleted = []
         self.admin_updates = []
         self.country_refreshes = []
+        self.main_assignments = []
+        self.main_commits = []
+        self.main_rollbacks = []
+        self.main_assignment_result = {
+            "ok": True,
+            "operation_id": "operation-safe-1",
+            "state": "pending_commit",
+            "old_candidate_id": "old-main",
+            "new_candidate_id": "node-safe",
+            "country": "JP",
+            "proxy_type": "datacenter",
+            "port": 7928,
+            "dns_verified": True,
+            "exit_verified": True,
+            "available": True,
+            "expires_at": 1_700_000_180,
+        }
         self.refresh_start_result = {"state": "running", "country": "JP", "testedCount": 0}
 
     def safe_candidate_snapshot(self):
@@ -29,7 +46,22 @@ class FakeManager:
         ]
 
     def safe_main_status(self):
-        return {"country": "JP", "country_name": "Japan", "proxy_type": "datacenter", "exit_ip": "203.0.113.20", "port": 7928, "egress_ok": True, "active": True}
+        return {"candidate_id": "old-main", "country": "JP", "country_name": "Japan", "proxy_type": "datacenter", "exit_ip": "203.0.113.20", "port": 7928, "egress_ok": True, "active": True}
+
+    def main_assignment_snapshot(self):
+        return dict(self.main_assignment_result)
+
+    def stage_main_assignment(self, candidate_id, country, proxy_type, expected, idempotency_key):
+        self.main_assignments.append((candidate_id, country, proxy_type, expected, idempotency_key))
+        return dict(self.main_assignment_result)
+
+    def commit_main_assignment(self, operation_id):
+        self.main_commits.append(operation_id)
+        return dict(self.main_assignment_result, state="committed")
+
+    def rollback_main_assignment(self, operation_id):
+        self.main_rollbacks.append(operation_id)
+        return dict(self.main_assignment_result, state="rolled_back")
 
     def country_catalog_snapshot(self):
         return [
@@ -146,6 +178,10 @@ class ControlAPITests(unittest.TestCase):
                 "slots.assign",
                 "slots.delete",
                 "main.read",
+                "main.assignment.read",
+                "main.assign",
+                "main.assign.commit",
+                "main.assign.rollback",
                 "admin.read",
                 "admin.verify",
                 "admin.update",
@@ -160,6 +196,66 @@ class ControlAPITests(unittest.TestCase):
         serialized = json.dumps(payload).lower()
         for forbidden in ["password", "token", "config", "process"]:
             self.assertNotIn(forbidden, serialized)
+
+    def test_main_assignment_uses_closed_routes_and_safe_payloads(self):
+        status, _, payload = self.request("GET", "/control/v1/main/assignment")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["data"]["state"], "pending_commit")
+
+        request = {
+            "candidateId": "node-safe",
+            "country": "jp",
+            "proxyType": "datacenter",
+            "expectedCurrentCandidateId": "old-main",
+            "idempotencyKey": "gateway-operation-1",
+        }
+        status, _, payload = self.request("POST", "/control/v1/main/assign", request)
+        self.assertEqual(status, 202)
+        self.assertEqual(
+            self.manager.main_assignments,
+            [("node-safe", "JP", "datacenter", "old-main", "gateway-operation-1")],
+        )
+        self.assertEqual(payload["data"]["operation_id"], "operation-safe-1")
+
+        status, _, payload = self.request(
+            "POST", "/control/v1/main/assign/operation-safe-1/commit", {}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["data"]["state"], "committed")
+
+        status, _, payload = self.request(
+            "POST", "/control/v1/main/assign/operation-safe-1/rollback", {}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["data"]["state"], "rolled_back")
+        serialized = json.dumps(payload).lower()
+        for forbidden in ["password", "token", "config", "cookie", "private"]:
+            self.assertNotIn(forbidden, serialized)
+
+    def test_main_assignment_rejects_unknown_fields_and_maps_busy(self):
+        request = {
+            "candidateId": "node-safe",
+            "country": "JP",
+            "proxyType": "datacenter",
+            "expectedCurrentCandidateId": "old-main",
+            "idempotencyKey": "gateway-operation-1",
+            "config": "must-not-pass",
+        }
+        status, _, payload = self.request("POST", "/control/v1/main/assign", request)
+        self.assertEqual(status, 400)
+        self.assertEqual(payload, {"error": {"code": "invalid_request"}})
+        self.assertEqual(self.manager.main_assignments, [])
+
+        self.manager.main_assignment_result = {"ok": False, "error_code": "operation_busy"}
+        request.pop("config")
+        status, _, payload = self.request("POST", "/control/v1/main/assign", request)
+        self.assertEqual(status, 409)
+        self.assertEqual(payload, {"error": {"code": "operation_busy"}})
+
+        status, _, payload = self.request(
+            "POST", "/control/v1/main/assign/not.valid/commit", {}
+        )
+        self.assertEqual(status, 404)
 
     def test_country_catalog_and_refresh_use_a_closed_safe_contract(self):
         status, _, payload = self.request("GET", "/control/v1/candidates/countries")

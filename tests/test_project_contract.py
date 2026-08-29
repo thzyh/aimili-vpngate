@@ -16,6 +16,17 @@ class ProjectContractTests(unittest.TestCase):
         ):
             self.assertIn(name, text)
 
+    def test_readme_documents_transactional_main_assignment(self):
+        text = (ROOT / "README.md").read_text(encoding="utf-8")
+        for name in (
+            "main.assign",
+            "pending_commit",
+            "commit",
+            "rollback",
+            "127.0.0.1",
+        ):
+            self.assertIn(name, text)
+
     def test_selfcheck_rejects_visible_unavailable_nodes(self):
         text = (ROOT / "scripts" / "selfcheck_multiexit.sh").read_text(
             encoding="utf-8"
