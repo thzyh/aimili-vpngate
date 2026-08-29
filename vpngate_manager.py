@@ -3067,6 +3067,52 @@ def managed_slots_snapshot() -> list[dict[str, Any]]:
         indices = sorted(exit_slots)
     return [snapshot for i in indices if (snapshot := managed_slot_snapshot(i)).get("ok")]
 
+def assign_managed_slot(i: int, node_id: str, country: str = "", proxy_type: str = "") -> dict[str, Any]:
+    """将一个可用候选装载到指定受管槽位，并在失败时恢复原节点和筛选元数据。"""
+    try:
+        slot = int(i)
+    except (TypeError, ValueError):
+        return {"ok": False, "error_code": "invalid_request"}
+    node_id = str(node_id or "").strip()
+    active = get_active_slots()
+    node = next((n for n in read_nodes() if str(n.get("id") or "") == node_id), None)
+    if slot not in active or node is None:
+        return {"ok": False, "error_code": "slot_not_found" if slot not in active else "candidate_not_found"}
+    if node.get("probe_status") != "available":
+        return {"ok": False, "error_code": "candidate_unavailable"}
+    normalized_country = str(country or node.get("country_short") or "").strip().upper()
+    normalized_type = normalize_proxy_type(proxy_type or node.get("proxy_type") or node.get("ip_type"))
+    if not re.fullmatch(r"[A-Z]{2}", normalized_country) or not normalized_type:
+        return {"ok": False, "error_code": "invalid_request"}
+    with exit_slots_lock:
+        for idx, current in exit_slots.items():
+            if idx != slot and current.get("node_id") == node_id:
+                return {"ok": False, "error_code": "candidate_in_use"}
+        previous = dict(exit_slots.get(slot) or {})
+    old_node_id = str(previous.get("node_id") or get_slot_pin_map().get(str(slot)) or "").strip()
+    old_country = get_slot_country_map().get(str(slot), "")
+    old_type = get_slot_type_map().get(str(slot), "")
+    set_slot_country(slot, normalized_country)
+    set_slot_type(slot, normalized_type)
+    result = assign_node_to_slot(slot, node_id)
+    if result.get("ok"):
+        snapshot = managed_slot_snapshot(slot)
+        snapshot["ok"] = True
+        return snapshot
+    if old_country:
+        set_slot_country(slot, old_country)
+    else:
+        set_slot_country(slot, "")
+    if old_type:
+        set_slot_type(slot, old_type)
+    else:
+        set_slot_type(slot, "")
+    if old_node_id and old_node_id != node_id:
+        restored = assign_node_to_slot(slot, old_node_id)
+        if not restored.get("ok"):
+            return {"ok": False, "error_code": "rollback_failed"}
+    return {"ok": False, "error_code": "assign_failed"}
+
 def create_managed_slot(country: str, proxy_type: str, candidate_id: str = "") -> dict[str, Any]:
     country = str(country or "").strip().upper()
     normalized_type = normalize_proxy_type(proxy_type)

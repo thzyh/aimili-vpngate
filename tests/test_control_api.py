@@ -70,6 +70,9 @@ class FakeManager:
     def rotate_managed_slot(self, slot):
         return {"ok": True, "slot": slot, "country": "JP", "proxy_type": "datacenter", "port": 17930, "status": "up"}
 
+    def assign_managed_slot(self, slot, candidate_id, country, proxy_type):
+        return {"ok": True, "slot": slot, "candidate_id": candidate_id, "country": country, "proxy_type": proxy_type, "port": 17930, "status": "up"}
+
     def check_managed_slot(self, slot):
         return {"ok": True, "slot": slot, "exit_ip": "203.0.113.8", "egress_ok": True}
 
@@ -140,6 +143,7 @@ class ControlAPITests(unittest.TestCase):
                 "slots.read",
                 "slots.rotate",
                 "slots.check",
+                "slots.assign",
                 "slots.delete",
                 "main.read",
                 "admin.read",
@@ -242,6 +246,21 @@ class ControlAPITests(unittest.TestCase):
         status, _, payload = self.request("DELETE", "/control/v1/slots/2")
         self.assertEqual((status, self.manager.deleted), (204, [2]))
         self.assertIsNone(payload)
+
+    def test_assign_slot_route_uses_closed_payload(self):
+        status, _, payload = self.request(
+            "POST", "/control/v1/slots/2/assign",
+            {"candidateId": "node-safe", "country": "jp", "proxyType": "datacenter"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["data"]["candidate_id"], "node-safe")
+
+        status, _, payload = self.request(
+            "POST", "/control/v1/slots/2/assign",
+            {"candidateId": "node-safe", "country": "JP", "proxyType": "datacenter", "config": "forbidden"},
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload, {"error": {"code": "invalid_request"}})
 
     def test_start_control_server_reads_nonempty_token_file(self):
         with tempfile.TemporaryDirectory() as temporary:

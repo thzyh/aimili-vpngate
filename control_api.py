@@ -24,6 +24,7 @@ CAPABILITIES = [
     "slots.read",
     "slots.rotate",
     "slots.check",
+    "slots.assign",
     "slots.delete",
     "main.read",
     "admin.read",
@@ -94,7 +95,7 @@ class ControlHandler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _slot_route(path: str) -> tuple[int, str] | None:
-        match = re.fullmatch(r"/control/v1/slots/(\d+)(?:/(rotate|check))?", path)
+        match = re.fullmatch(r"/control/v1/slots/(\d+)(?:/(rotate|check|assign))?", path)
         if not match:
             return None
         return int(match.group(1)), match.group(2) or ""
@@ -204,8 +205,16 @@ class ControlHandler(BaseHTTPRequestHandler):
             if self.command == "GET" and not action:
                 self._manager_result(self.server.manager.managed_slot_snapshot(slot))
                 return
-            if self.command == "POST" and action in ("rotate", "check"):
-                self._read_object(set())
+            if self.command == "POST" and action in ("rotate", "check", "assign"):
+                payload = self._read_object({"candidateId", "country", "proxyType"} if action == "assign" else set())
+                if action == "assign":
+                    candidate_id = str(payload.get("candidateId") or "").strip()
+                    country = str(payload.get("country") or "").strip().upper()
+                    proxy_type = str(payload.get("proxyType") or "").strip().lower()
+                    if not candidate_id or len(candidate_id) > 256 or not re.fullmatch(r"[A-Z]{2}", country) or proxy_type not in ("residential", "datacenter"):
+                        raise ValueError("invalid request")
+                    self._manager_result(self.server.manager.assign_managed_slot(slot, candidate_id, country, proxy_type))
+                    return
                 method = (
                     self.server.manager.rotate_managed_slot
                     if action == "rotate"
