@@ -7,6 +7,7 @@ from node_pool import (
     merge_probe_results,
     protected_active_nodes,
     protected_node_ids,
+    rebalance_valid_pool,
 )
 
 
@@ -15,6 +16,37 @@ def node(node_id, status="not_checked", active=False):
 
 
 class NodePoolTests(unittest.TestCase):
+    def test_rebalance_is_stable_keeps_country_anchors_and_never_exceeds_limit(self):
+        existing = [
+            {**node("jp-old", "available"), "country_short": "JP", "ip_type": "hosting", "latency_ms": 50},
+            {**node("us-old", "available"), "country_short": "US", "ip_type": "hosting", "latency_ms": 60},
+        ]
+        refreshed = [
+            {**node("jp-home", "available"), "country_short": "JP", "ip_type": "residential", "latency_ms": 10},
+            {**node("de-home", "available"), "country_short": "DE", "ip_type": "mobile", "latency_ms": 20},
+            {**node("bad", "unavailable"), "country_short": "FR", "ip_type": "hosting", "latency_ms": 1},
+        ]
+
+        first = rebalance_valid_pool(existing, refreshed, set(), set(), limit=3)
+        second = rebalance_valid_pool(list(reversed(existing)), list(reversed(refreshed)), set(), set(), limit=3)
+
+        self.assertEqual([item["id"] for item in first], ["jp-old", "us-old", "de-home"])
+        self.assertEqual([item["id"] for item in second], ["jp-old", "us-old", "de-home"])
+
+    def test_rebalance_hard_protects_runtime_and_prefers_manual_success(self):
+        existing = [
+            {**node("runtime", "unavailable"), "country_short": "JP"},
+            {**node("old", "available"), "country_short": "US"},
+        ]
+        refreshed = [
+            {**node("manual", "available"), "country_short": "DE", "ip_type": "hosting"},
+            {**node("fresh", "available"), "country_short": "FR", "ip_type": "residential"},
+        ]
+
+        result = rebalance_valid_pool(existing, refreshed, {"runtime"}, {"manual"}, limit=3)
+
+        self.assertEqual([item["id"] for item in result], ["runtime", "manual", "old"])
+
     def test_country_filter_runs_on_raw_rows_without_global_truncation(self):
         rows = [
             {"IP": "192.0.2.1", "CountryShort": "US"},

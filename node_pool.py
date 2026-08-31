@@ -129,3 +129,80 @@ def merge_probe_results(
         else:
             failed.append(node)
     return merged[:target_size], failed
+
+
+def rebalance_valid_pool(
+    existing_nodes: list[Node],
+    refreshed_nodes: list[Node],
+    protected_ids: set[str],
+    manual_ids: set[str],
+    limit: int = 30,
+) -> list[Node]:
+    """Select a stable bounded pool while preserving runtime and country coverage."""
+    capacity = max(0, min(30, int(limit)))
+    existing_ids = {_node_id(node) for node in existing_nodes}
+    by_id: dict[str, Node] = {}
+    for item in [*refreshed_nodes, *existing_nodes]:
+        node_id = _node_id(item)
+        if node_id:
+            by_id[node_id] = item
+
+    def country(item: Node) -> str:
+        return str(item.get("country_short") or "").strip().upper()
+
+    def quality(item: Node) -> tuple[int, int, float, str]:
+        kind = str(item.get("ip_type") or "").strip().lower()
+        kind_rank = 0 if kind in ("residential", "mobile") else 1
+        try:
+            latency = int(item.get("latency_ms") or item.get("ping") or 999999)
+        except (TypeError, ValueError):
+            latency = 999999
+        try:
+            score = -float(item.get("score") or 0)
+        except (TypeError, ValueError):
+            score = 0
+        return kind_rank, latency, score, _node_id(item)
+
+    selected: list[Node] = []
+    seen: set[str] = set()
+
+    def add(item: Node, allow_unavailable: bool = False) -> None:
+        node_id = _node_id(item)
+        if len(selected) >= capacity or not node_id or node_id in seen:
+            return
+        if not allow_unavailable and item.get("probe_status") != "available":
+            return
+        selected.append(item)
+        seen.add(node_id)
+
+    for node_id in sorted(protected_ids):
+        if node_id in by_id:
+            add(by_id[node_id], allow_unavailable=True)
+    for node_id in sorted(manual_ids):
+        if node_id in by_id:
+            add(by_id[node_id])
+
+    available = [item for item in by_id.values() if item.get("probe_status") == "available"]
+    existing_countries = sorted({country(item) for item in available if _node_id(item) in existing_ids and country(item)})
+    new_countries = sorted({country(item) for item in available if country(item)} - set(existing_countries))
+    for code in [*existing_countries, *new_countries]:
+        if any(country(item) == code for item in selected):
+            continue
+        candidates = [item for item in available if country(item) == code]
+        old = [item for item in candidates if _node_id(item) in existing_ids]
+        add(min(old or candidates, key=quality))
+
+    old_healthy = sorted(
+        (item for item in available if _node_id(item) in existing_ids), key=quality
+    )
+    new_residential = sorted(
+        (item for item in available if _node_id(item) not in existing_ids and str(item.get("ip_type") or "").lower() in ("residential", "mobile")),
+        key=quality,
+    )
+    new_datacenter = sorted(
+        (item for item in available if _node_id(item) not in existing_ids and item not in new_residential),
+        key=quality,
+    )
+    for item in [*old_healthy, *new_residential, *new_datacenter]:
+        add(item)
+    return selected

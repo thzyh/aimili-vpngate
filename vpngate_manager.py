@@ -116,7 +116,7 @@ CHECK_INTERVAL_SECONDS = env_int("CHECK_INTERVAL_SECONDS", 1260, 1)
 _legacy_max_scan_rows = env_int("MAX_SCAN_ROWS", 300, 1)
 MAX_FETCH_ROWS = env_int("MAX_FETCH_ROWS", _legacy_max_scan_rows, 1)
 _legacy_target_valid_nodes = env_int("TARGET_VALID_NODES", 30, 1)
-TARGET_VALID_POOL_SIZE = env_int("TARGET_VALID_POOL_SIZE", _legacy_target_valid_nodes, 1)
+TARGET_VALID_POOL_SIZE = min(30, env_int("TARGET_VALID_POOL_SIZE", _legacy_target_valid_nodes, 1))
 TARGET_VALID_NODES = TARGET_VALID_POOL_SIZE
 NODE_TEST_BATCH_SIZE = env_int("NODE_TEST_BATCH_SIZE", 10, 1)
 PROBE_FAILURE_COOLDOWN_SECONDS = env_int("PROBE_FAILURE_COOLDOWN_SECONDS", 1800, 1)
@@ -170,6 +170,7 @@ UPSTREAM_PROXY_AUTH_FILE = DATA_DIR / "upstream_proxy_auth.txt"
 BLACKLIST_FILE = DATA_DIR / "blacklist.json"
 SLOTS_FILE = DATA_DIR / "slots.json"
 COUNTRY_CATALOG_FILE = DATA_DIR / "country_catalog.json"
+POOL_METADATA_FILE = DATA_DIR / "pool_metadata.json"
 MAIN_ASSIGNMENT_FILE = DATA_DIR / "main_assignment.json"
 
 lock = threading.RLock()
@@ -245,6 +246,38 @@ def read_json(path: Path, default: Any) -> Any:
             return json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return default
+
+
+def default_pool_metadata() -> dict[str, Any]:
+    return {
+        "schemaVersion": 1,
+        "maintenanceRound": 0,
+        "manualProtectedIds": [],
+        "manualProtectionExpiresRound": 0,
+        "officialCandidateCount": 0,
+        "officialCountryCount": 0,
+        "observedAt": 0.0,
+        "lastRefresh": {},
+    }
+
+
+def load_pool_metadata() -> dict[str, Any]:
+    raw = read_json(POOL_METADATA_FILE, {})
+    if not isinstance(raw, dict) or raw.get("schemaVersion") != 1:
+        return default_pool_metadata()
+    result = default_pool_metadata()
+    result.update({key: raw[key] for key in result if key in raw})
+    if not isinstance(result["manualProtectedIds"], list):
+        result["manualProtectedIds"] = []
+    if not isinstance(result["lastRefresh"], dict):
+        result["lastRefresh"] = {}
+    return result
+
+
+def store_pool_metadata(metadata: dict[str, Any]) -> None:
+    safe = default_pool_metadata()
+    safe.update({key: metadata[key] for key in safe if key in metadata})
+    write_json(POOL_METADATA_FILE, safe)
 
 import hashlib
 import random
@@ -1164,13 +1197,25 @@ def build_country_catalog(
 
 
 def store_country_catalog(rows: list[dict[str, str]]) -> None:
-    write_json(COUNTRY_CATALOG_FILE, build_country_catalog(rows))
+    catalog = build_country_catalog(rows)
+    write_json(COUNTRY_CATALOG_FILE, catalog)
+    metadata = load_pool_metadata()
+    metadata.update(
+        officialCandidateCount=sum(item["candidateCount"] for item in catalog),
+        officialCountryCount=len(catalog),
+        observedAt=max((item["observedAt"] for item in catalog), default=0.0),
+    )
+    store_pool_metadata(metadata)
 
 
 def country_catalog_snapshot() -> list[dict[str, Any]]:
     raw = read_json(COUNTRY_CATALOG_FILE, [])
     if not isinstance(raw, list):
         return []
+    nodes = read_nodes()
+    valid_nodes = [item for item in nodes if item.get("probe_status") == "available"]
+    valid_country_count = len({str(item.get("country_short") or "").upper() for item in valid_nodes if item.get("country_short")})
+    official_total = sum(max(0, parse_int(item.get("candidateCount"))) for item in raw if isinstance(item, dict))
     result: list[dict[str, Any]] = []
     for item in raw:
         if not isinstance(item, dict):
@@ -1184,6 +1229,9 @@ def country_catalog_snapshot() -> list[dict[str, Any]]:
                 "name": str(item.get("name") or code),
                 "candidateCount": max(0, parse_int(item.get("candidateCount"))),
                 "observedAt": float(item.get("observedAt") or 0),
+                "officialCandidateTotal": official_total,
+                "validNodeCount": len(valid_nodes),
+                "validCountryCount": valid_country_count,
             }
         )
     return result
@@ -2077,7 +2125,20 @@ def replenish_valid_pool(
 
 def country_refresh_snapshot() -> dict[str, Any]:
     with country_refresh_lock:
-        return dict(country_refresh_state)
+        snapshot = dict(country_refresh_state)
+    nodes = read_nodes()
+    snapshot["cacheTotal"] = len(nodes)
+    country = str(snapshot.get("country") or "").upper()
+    snapshot["countryValidCount"] = sum(
+        1 for item in nodes
+        if item.get("probe_status") == "available"
+        and str(item.get("country_short") or "").upper() == country
+    )
+    if snapshot.get("state") == "idle":
+        persisted = load_pool_metadata().get("lastRefresh") or {}
+        if isinstance(persisted, dict) and persisted:
+            snapshot.update(persisted)
+    return snapshot
 
 
 def _set_country_refresh(**updates: Any) -> dict[str, Any]:
@@ -2092,10 +2153,7 @@ def _country_refresh_worker(country: str, start_gate: threading.Event) -> None:
     try:
         result = refresh_country_nodes(country, _lock_held=True)
         _set_country_refresh(
-            **result,
-            phase="",
-            finishedAt=time.time(),
-            errorCode="",
+            **{**result, "phase": "", "finishedAt": time.time(), "errorCode": ""}
         )
     except Exception:
         _set_country_refresh(
@@ -2175,6 +2233,13 @@ def refresh_country_nodes(
     try:
         existing_nodes = read_nodes()
         candidates = fetch_candidates(normalized_country)
+        candidates.sort(
+            key=lambda item: (
+                0 if str(item.get("ip_type") or "").lower() in ("residential", "mobile") else 1,
+                parse_int(item.get("latency_ms") or item.get("ping")) or 999999,
+                str(item.get("id") or ""),
+            )
+        )
         catalog_count = sum(
             max(0, parse_int(item.get("candidateCount")))
             for item in country_catalog_snapshot()
@@ -2261,12 +2326,15 @@ def refresh_country_nodes(
 
         if _lock_held:
             _set_country_refresh(phase="merging")
-        merged = node_pool.merge_country_pool(
-            existing_nodes,
-            selected,
-            normalized_country,
-            protected_ids,
-            target_size,
+        manual_ids = {
+            str(item.get("id") or "").strip()
+            for item in selected
+            if item.get("probe_status") == "available"
+            and str(item.get("id") or "").strip() not in protected_ids
+        }
+        metadata = load_pool_metadata()
+        merged = node_pool.rebalance_valid_pool(
+            existing_nodes, selected, protected_ids, manual_ids, limit=30
         )
         for item in merged:
             config_file = str(item.get("config_file") or "")
@@ -2293,7 +2361,14 @@ def refresh_country_nodes(
             "validCount": valid_count,
             "preservedCount": len(protected_country_nodes),
             "stopReason": stop_reason,
+            "cacheTotal": len(merged),
+            "countryValidCount": valid_count,
+            "finishedAt": time.time(),
         }
+        metadata["manualProtectedIds"] = sorted(manual_ids)
+        metadata["manualProtectionExpiresRound"] = int(metadata.get("maintenanceRound") or 0) + 1
+        metadata["lastRefresh"] = dict(result)
+        store_pool_metadata(metadata)
         set_state(last_check_at=time.time(), last_check_message=f"国家 {normalized_country} 节点刷新完成")
         return result
     finally:
@@ -2659,6 +2734,22 @@ def maintain_valid_nodes(force: bool = False) -> str:
             load_blacklist(),
             probe_nodes,
         )
+        metadata = load_pool_metadata()
+        next_round = int(metadata.get("maintenanceRound") or 0) + 1
+        manual_ids = set()
+        if int(metadata.get("manualProtectionExpiresRound") or 0) >= next_round:
+            manual_ids = {
+                str(node_id or "").strip()
+                for node_id in metadata.get("manualProtectedIds", [])
+                if str(node_id or "").strip()
+            }
+        protected_ids = node_pool.protected_node_ids(
+            active_openvpn_node_id, list(reserved_slot_candidate_ids())
+        )
+        protected_ids.update(main_assignment_coordinator.reserved_candidate_ids())
+        merged = node_pool.rebalance_valid_pool(
+            existing_nodes, merged, protected_ids, manual_ids, limit=30
+        )
         merged = sort_all_nodes(merged)
         for node in merged:
             config_file = str(node.get("config_file") or "")
@@ -2673,6 +2764,11 @@ def maintain_valid_nodes(force: bool = False) -> str:
                     print(f"[节点池] 保存节点配置 {node.get('id')} 失败: {exc}", flush=True)
         write_json(BLACKLIST_FILE, blacklist)
         write_json(NODES_FILE, merged)
+        metadata["maintenanceRound"] = next_round
+        if int(metadata.get("manualProtectionExpiresRound") or 0) <= next_round:
+            metadata["manualProtectedIds"] = []
+            metadata["manualProtectionExpiresRound"] = 0
+        store_pool_metadata(metadata)
         is_connecting = False
 
         with lock:

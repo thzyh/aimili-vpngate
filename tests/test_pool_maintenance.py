@@ -1,6 +1,8 @@
 import base64
+import tempfile
 import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import vpngate_manager as manager
@@ -28,6 +30,17 @@ def country_node(node_id, country, status="not_checked"):
 
 
 class PoolMaintenanceTests(unittest.TestCase):
+    def test_corrupt_pool_metadata_returns_safe_defaults_without_touching_nodes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            metadata = Path(directory) / "pool_metadata.json"
+            metadata.write_text("{broken", encoding="utf-8")
+            with mock.patch.object(manager, "POOL_METADATA_FILE", metadata):
+                result = manager.load_pool_metadata()
+
+        self.assertEqual(result["schemaVersion"], 1)
+        self.assertEqual(result["maintenanceRound"], 0)
+        self.assertEqual(result["manualProtectedIds"], [])
+
     def test_country_refresh_runs_in_background_and_exposes_safe_status(self):
         candidates = [country_node("jp-one", "JP")]
         with (
@@ -95,10 +108,10 @@ class PoolMaintenanceTests(unittest.TestCase):
 
         self.assertEqual(result["state"], "completed")
         self.assertEqual(result["testedCount"], 4)
-        self.assertEqual(result["validCount"], 5)
+        self.assertEqual(result["validCount"], 6)
         self.assertEqual(
             [item["id"] for item in stored_nodes],
-            ["us-existing", "jp-slot", "jp-new-0", "jp-new-1", "jp-new-2", "jp-new-3"],
+            ["jp-slot", "jp-new-0", "jp-new-1", "jp-new-2", "jp-new-3", "us-existing", "jp-old"],
         )
 
     def test_country_refresh_stops_after_twenty_failed_real_probes(self):
