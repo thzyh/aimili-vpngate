@@ -11,10 +11,12 @@
 
 - 新增仅回环、Bearer 鉴权的主连接两阶段事务控制契约：`stage → commit/rollback`，支持跨重启幂等、180 秒超时自动回滚与安全状态读取。
 - 主连接 stage 同时验证 `7928` 的代理 DNS、真实出口和可用性；新主失败自动恢复旧主，旧主恢复失败才进入 `repair_required`。
+- 新增 `repair-commit` 与 `repair-replace` 运维修复动作：两者重新拨号并验证 `7928` 后只进入 `pending_gateway_validation`，由 Gateway 完成主 mixed/公网协议联合验证后才 finalize；repair 与 maintenance/slot mutation 共用锁边界并支持幂等重放。
 
 ### 变更 (Changed)
 
 - 主事务期间统一阻止候选刷新、槽位变更和后台漂移；当前主、事务旧/新主及槽位节点不会重复进入候选列表。
+- stage 前拒绝缺少恢复材料的当前主；事务保留候选在拨号失败后仍保留受限配置，避免 `repair_required` 重试因节点池过滤而失去恢复材料。
 - 控制响应只公开操作状态、候选身份、端口和验证布尔值，不公开 OpenVPN 配置或认证材料。
 
 ## [Custom 1.1.0] - 2026-08-24

@@ -237,9 +237,9 @@ DNS 污染或域名被拦截。可在「管理员 → 代理设置」配置上�
 
 ### Gateway 主连接事务控制
 
-仅回环控制面 `127.0.0.1` 提供 `main.assign`、`main.assign.commit`、`main.assign.rollback` 与 `main.assignment.read` 能力。主连接替换先进入 `pending_commit`：AimiliVPN 已验证 `7928` 的代理 DNS、真实出口和可用性，但仍保留旧主用于回滚；Gateway 完成 mixed 与公网协议验证后调用 `commit`，失败则调用 `rollback`。
+仅回环控制面 `127.0.0.1` 提供 `main.assign`、`main.assign.commit`、`main.assign.rollback`、`main.assign.repair-commit`、`main.assign.repair-replace` 与 `main.assignment.read` 能力。主连接替换先进入 `pending_commit`：AimiliVPN 已验证 `7928` 的代理 DNS、真实出口和可用性，但仍保留旧主用于回滚；Gateway 完成 mixed 与公网协议验证后调用 `commit`，失败则调用 `rollback`。
 
-事务默认 180 秒过期。服务启动和后台恢复循环会自动处理超期或中断的事务；旧主恢复失败时才进入 `repair_required`。事务进行期间，候选刷新、槽位 create/assign/rotate/delete、后台漂移和其他主连接切换均被拒绝，且当前主、待提交新主和槽位节点不会重复出现在候选列表中。控制响应不返回 OpenVPN 配置、认证材料或其他连接秘密。
+事务默认 180 秒过期。服务启动和后台恢复循环会自动处理超期或中断的事务；stage 前必须确认当前主仍有受限节点池恢复材料，旧主恢复失败时才进入 `repair_required`。事务保留的旧/新候选即使一次拨号失败也不会被节点池过滤删除；运维 repair 只在 AimiliVPN 重新拨号并验证 `7928` 后进入 `pending_gateway_validation`，继续保留事务保护，必须由 Gateway 验证主 mixed 与主当前公网协议且三者出口一致后调用 `commit`。Gateway 验证失败时不得 finalize 或静默选择第三候选。事务期间候选刷新、槽位 create/assign/rotate/delete、后台漂移和其他主切换均被拒绝。控制响应不返回 OpenVPN 配置、认证材料或其他连接秘密。
 
 <a name="english"></a>
 ## English

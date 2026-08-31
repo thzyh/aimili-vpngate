@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import csv
+import functools
 import hmac
 import json
 import os
@@ -172,6 +173,7 @@ COUNTRY_CATALOG_FILE = DATA_DIR / "country_catalog.json"
 MAIN_ASSIGNMENT_FILE = DATA_DIR / "main_assignment.json"
 
 lock = threading.RLock()
+mutation_lock = threading.RLock()
 maintenance_lock = threading.Lock()
 country_refresh_lock = threading.RLock()
 country_refresh_state: dict[str, Any] = {
@@ -542,6 +544,74 @@ def main_mutation_allowed() -> bool:
     return main_assignment_coordinator.mutation_allowed()
 
 
+def _acquire_runtime_mutation(*, assignment_action: bool = False) -> bool:
+    if not mutation_lock.acquire(blocking=False):
+        return False
+    refresh_authorized = bool(
+        getattr(main_assignment_thread, "country_refresh_authorized", False)
+    )
+    with country_refresh_lock:
+        refresh_running = country_refresh_state.get("state") == "running"
+    allowed = (
+        main_assignment_coordinator.assignment_action_allowed()
+        if assignment_action
+        else main_mutation_allowed()
+    )
+    allowed = allowed and (not refresh_running or refresh_authorized)
+    if not allowed:
+        mutation_lock.release()
+        return False
+    return True
+
+
+def _release_runtime_mutation() -> None:
+    mutation_lock.release()
+
+
+def _mutation_guard(busy_result: Any = None, *, raise_busy: bool = False):
+    def decorate(function):
+        @functools.wraps(function)
+        def guarded(*args, **kwargs):
+            authorized = bool(getattr(main_assignment_thread, "authorized", False))
+            if not _acquire_runtime_mutation(assignment_action=authorized):
+                if raise_busy:
+                    raise RuntimeError("主连接或 mutation lease 正在进行，请稍后再试")
+                return dict(busy_result) if isinstance(busy_result, dict) else busy_result
+            try:
+                return function(*args, **kwargs)
+            finally:
+                _release_runtime_mutation()
+        return guarded
+    return decorate
+
+
+def _acquire_assignment_boundary() -> bool:
+    if not _acquire_runtime_mutation(assignment_action=True):
+        return False
+    if not maintenance_lock.acquire(blocking=False):
+        _release_runtime_mutation()
+        return False
+    if not exit_slots_supervise_lock.acquire(blocking=False):
+        maintenance_lock.release()
+        _release_runtime_mutation()
+        return False
+    return True
+
+
+def _release_assignment_boundary() -> None:
+    exit_slots_supervise_lock.release()
+    maintenance_lock.release()
+    _release_runtime_mutation()
+
+
+def main_reserved_candidate_ids() -> set[str]:
+    reserved = main_assignment_coordinator.reserved_candidate_ids()
+    active_id = str(active_openvpn_node_id or "").strip()
+    if active_id:
+        reserved.add(active_id)
+    return reserved
+
+
 def _main_connection_snapshot() -> dict[str, Any]:
     active_id = str(active_openvpn_node_id or "").strip()
     active = next(
@@ -557,6 +627,7 @@ def _main_connection_snapshot() -> dict[str, Any]:
         "routing_mode": str(ui_cfg.get("routing_mode") or "auto"),
         "routing_ip_type": str(ui_cfg.get("routing_ip_type") or "all"),
         "fixed_node_id": str(ui_cfg.get("fixed_node_id") or ""),
+        "restorable": bool(active_id and active and str(active.get("config_text") or "").strip()),
     }
 
 
@@ -581,6 +652,7 @@ def _stage_main_candidate(candidate_id: str) -> dict[str, bool]:
 
 
 def _restore_main_candidate(previous: dict[str, Any]) -> dict[str, bool]:
+    global is_connecting
     previous_id = str(previous.get("candidate_id") or "").strip()
     if not previous_id:
         return {"dns_verified": False, "exit_verified": False, "available": False}
@@ -594,6 +666,8 @@ def _restore_main_candidate(previous: dict[str, Any]) -> dict[str, bool]:
         if key in previous:
             ui_cfg[key] = previous[key]
     _write_ui_config_atomic(ui_cfg)
+    with lock:
+        is_connecting = False
     main_assignment_thread.authorized = True
     try:
         connect_node(previous_id)
@@ -643,7 +717,7 @@ def _stage_main_assignment_unlocked(
         expected_current_candidate_id=expected,
         idempotency_key=idempotency_key,
         current=_main_connection_snapshot(),
-        slot_candidate_ids=current_slot_node_ids(),
+        slot_candidate_ids=reserved_slot_candidate_ids(),
         stage_candidate=_stage_main_candidate,
         restore_previous=_restore_main_candidate,
     )
@@ -656,10 +730,7 @@ def stage_main_assignment(
     expected_current_candidate_id: str,
     idempotency_key: str,
 ) -> dict[str, Any]:
-    if not maintenance_lock.acquire(blocking=False):
-        return {"ok": False, "error_code": "operation_busy"}
-    if not exit_slots_supervise_lock.acquire(blocking=False):
-        maintenance_lock.release()
+    if not _acquire_assignment_boundary():
         return {"ok": False, "error_code": "operation_busy"}
     try:
         return _stage_main_assignment_unlocked(
@@ -670,23 +741,121 @@ def stage_main_assignment(
             idempotency_key,
         )
     finally:
-        exit_slots_supervise_lock.release()
-        maintenance_lock.release()
+        _release_assignment_boundary()
 
 
 def commit_main_assignment(operation_id: str) -> dict[str, Any]:
-    return main_assignment_coordinator.commit(str(operation_id or "").strip())
+    if not _acquire_runtime_mutation(assignment_action=True):
+        return {"ok": False, "error_code": "operation_busy"}
+    try:
+        return main_assignment_coordinator.commit(str(operation_id or "").strip())
+    finally:
+        _release_runtime_mutation()
 
 
 def rollback_main_assignment(operation_id: str) -> dict[str, Any]:
-    return main_assignment_coordinator.rollback(
-        str(operation_id or "").strip(),
-        _restore_main_candidate,
-    )
+    if not _acquire_assignment_boundary():
+        return {"ok": False, "error_code": "operation_busy"}
+    try:
+        return main_assignment_coordinator.rollback(
+            str(operation_id or "").strip(),
+            _restore_main_candidate,
+        )
+    finally:
+        _release_assignment_boundary()
+
+
+def repair_commit_main_assignment(operation_id: str) -> dict[str, Any]:
+    if not _acquire_assignment_boundary():
+        return {"ok": False, "error_code": "operation_busy"}
+    try:
+        return main_assignment_coordinator.repair_commit(
+            str(operation_id or "").strip(),
+            _stage_repair_main_candidate,
+        )
+    finally:
+        _release_assignment_boundary()
+
+
+def _stage_repair_main_candidate(candidate_id: str) -> dict[str, bool]:
+    global is_connecting
+    with lock:
+        is_connecting = False
+    return _stage_main_candidate(candidate_id)
+
+
+def repair_replace_main_assignment(
+    operation_id: str,
+    candidate_id: str,
+    country: str,
+    proxy_type: str,
+) -> dict[str, Any]:
+    candidate_id = str(candidate_id or "").strip()
+    country = str(country or "").strip().upper()
+    proxy_type = normalize_proxy_type(proxy_type)
+    if not _acquire_assignment_boundary():
+        return {"ok": False, "error_code": "operation_busy"}
+    try:
+        candidate = next(
+            (item for item in read_nodes() if str(item.get("id") or "").strip() == candidate_id),
+            None,
+        )
+        if candidate is None:
+            return {"ok": False, "error_code": "candidate_not_found"}
+        if candidate.get("probe_status") != "available":
+            return {"ok": False, "error_code": "candidate_unavailable"}
+        if candidate_id in reserved_slot_candidate_ids():
+            return {"ok": False, "error_code": "candidate_in_use"}
+        if (
+            str(candidate.get("country_short") or "").strip().upper() != country
+            or normalize_proxy_type(candidate.get("ip_type")) != proxy_type
+        ):
+            return {"ok": False, "error_code": "candidate_mismatch"}
+        return main_assignment_coordinator.repair_replace(
+            str(operation_id or "").strip(),
+            candidate_id,
+            country,
+            proxy_type,
+            _stage_repair_main_candidate,
+        )
+    finally:
+        _release_assignment_boundary()
 
 
 def recover_main_assignment() -> dict[str, Any]:
-    return main_assignment_coordinator.recover(_restore_main_candidate)
+    if not _acquire_assignment_boundary():
+        return {"ok": False, "error_code": "operation_busy"}
+    try:
+        return main_assignment_coordinator.recover(_restore_main_candidate)
+    finally:
+        _release_assignment_boundary()
+
+
+def acquire_mutation_lease(idempotency_key: str) -> dict[str, Any]:
+    if not mutation_lock.acquire(blocking=False):
+        return {"ok": False, "error_code": "operation_busy"}
+    try:
+        return main_assignment_coordinator.acquire_mutation_lease(idempotency_key)
+    finally:
+        mutation_lock.release()
+
+
+def renew_mutation_lease(lease_id: str) -> dict[str, Any]:
+    if not mutation_lock.acquire(blocking=False):
+        return {"ok": False, "error_code": "operation_busy"}
+    try:
+        return main_assignment_coordinator.renew_mutation_lease(lease_id)
+    finally:
+        mutation_lock.release()
+
+
+def release_mutation_lease(lease_id: str) -> dict[str, Any]:
+    if not mutation_lock.acquire(blocking=False):
+        return {"ok": False, "error_code": "operation_busy"}
+    try:
+        return main_assignment_coordinator.release_mutation_lease(lease_id)
+    finally:
+        mutation_lock.release()
 
 
 def main_assignment_recovery_loop() -> None:
@@ -1500,6 +1669,7 @@ def cleanup_policy_routing(table: int = 100) -> None:
     except Exception:
         pass
 
+@_mutation_guard(raise_busy=True)
 def stop_active_openvpn() -> None:
     global active_openvpn_process, active_openvpn_node_id
     with lock:
@@ -1529,12 +1699,14 @@ def active_openvpn_running() -> bool:
 
 def sort_all_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     runtime_active_id = str(active_openvpn_node_id or "")
+    reserved_ids = main_assignment_coordinator.reserved_candidate_ids()
     available_nodes = sorted(
         [
             n
             for n in nodes
             if n.get("probe_status") == "available"
             or (runtime_active_id and str(n.get("id") or "") == runtime_active_id)
+            or str(n.get("id") or "") in reserved_ids
         ],
         key=lambda n: (
             0 if n.get("ip_type") in ("residential", "mobile") else 1,
@@ -1563,6 +1735,7 @@ def test_config_path(node_id: str) -> Path:
     safe_id = safe_name(node_id)
     return CONFIG_DIR / f".test_{safe_id}_{uuid.uuid4().hex}.ovpn"
 
+@_mutation_guard(raise_busy=True)
 def test_node_by_id(node_id: str) -> dict[str, Any]:
     with lock:
         nodes = read_nodes()
@@ -1780,6 +1953,7 @@ def probe_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [results[node["id"]] for node in nodes if node.get("id") in results]
 
 
+@_mutation_guard(raise_busy=True)
 def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
     """按 ID 验证当前可见节点，并把结果写回节点池。"""
     with lock:
@@ -1907,7 +2081,9 @@ def _set_country_refresh(**updates: Any) -> dict[str, Any]:
         return dict(country_refresh_state)
 
 
-def _country_refresh_worker(country: str) -> None:
+def _country_refresh_worker(country: str, start_gate: threading.Event) -> None:
+    start_gate.wait()
+    main_assignment_thread.country_refresh_authorized = True
     try:
         result = refresh_country_nodes(country, _lock_held=True)
         _set_country_refresh(
@@ -1923,15 +2099,22 @@ def _country_refresh_worker(country: str) -> None:
             finishedAt=time.time(),
             errorCode="refresh_failed",
         )
+    finally:
+        main_assignment_thread.country_refresh_authorized = False
 
 
 def start_country_refresh(country: str) -> dict[str, Any]:
     normalized_country = str(country or "").strip().upper()
     if not re.fullmatch(r"[A-Z]{2}", normalized_country):
         return {"state": "failed", "country": normalized_country, "errorCode": "invalid_country"}
-    if not main_mutation_allowed():
+    if not _acquire_runtime_mutation():
         return {"state": "failed", "country": normalized_country, "errorCode": "operation_busy"}
+    with country_refresh_lock:
+        if country_refresh_state.get("state") == "running":
+            _release_runtime_mutation()
+            return {"state": "failed", "country": normalized_country, "errorCode": "maintenance_busy"}
     if not maintenance_lock.acquire(blocking=False):
+        _release_runtime_mutation()
         return {"state": "failed", "country": normalized_country, "errorCode": "maintenance_busy"}
     accepted = _set_country_refresh(
         state="running",
@@ -1946,24 +2129,29 @@ def start_country_refresh(country: str) -> dict[str, Any]:
         finishedAt=0.0,
         errorCode="",
     )
+    start_gate = threading.Event()
     try:
         threading.Thread(
             target=_country_refresh_worker,
-            args=(normalized_country,),
+            args=(normalized_country, start_gate),
             name=f"country-refresh-{normalized_country}",
             daemon=True,
         ).start()
     except Exception:
         maintenance_lock.release()
+        _release_runtime_mutation()
         return _set_country_refresh(
             state="failed",
             phase="",
             finishedAt=time.time(),
             errorCode="worker_start_failed",
         )
+    _release_runtime_mutation()
+    start_gate.set()
     return accepted
 
 
+@_mutation_guard({"state": "failed", "country": "", "errorCode": "operation_busy"})
 def refresh_country_nodes(
     country: str,
     target_size: int = 5,
@@ -1994,7 +2182,7 @@ def refresh_country_nodes(
             )
         protected_ids = node_pool.protected_node_ids(
             active_openvpn_node_id,
-            list(current_slot_node_ids()),
+            list(reserved_slot_candidate_ids()),
         )
         protected_ids.update(main_assignment_coordinator.reserved_candidate_ids())
         protected_country_nodes = [
@@ -2132,6 +2320,7 @@ def reset_main_proxy_connections() -> None:
     except Exception as e:
         print(f"[主代理] 重置下游连接异常: {e}", flush=True)
 
+@_mutation_guard(None)
 def auto_switch_node(attempt: int = 0) -> None:
     if not main_mutation_allowed():
         return
@@ -2152,6 +2341,7 @@ def auto_switch_node(attempt: int = 0) -> None:
         print("[自动切换] 当前处于固定 IP 模式，不进行自动连接或切换。", flush=True)
         return
 
+    slot_candidate_ids = reserved_slot_candidate_ids()
     # Find the next best available node
     with lock:
         nodes = read_nodes()
@@ -2162,6 +2352,7 @@ def auto_switch_node(attempt: int = 0) -> None:
             if n.get("probe_status") == "available" 
             and not n.get("active")
             and n.get("id") not in bad
+            and n.get("id") not in slot_candidate_ids
         ]
         
         if routing_mode == "fixed_region" and target_country:
@@ -2234,6 +2425,7 @@ def auto_switch_node(attempt: int = 0) -> None:
         
         threading.Thread(target=bg_fetch_and_switch, daemon=True).start()
 
+@_mutation_guard(raise_busy=True)
 def connect_node(node_id: str) -> str:
     global active_openvpn_process, active_openvpn_node_id, is_connecting
     if not main_mutation_allowed() and not bool(getattr(main_assignment_thread, "authorized", False)):
@@ -2241,6 +2433,8 @@ def connect_node(node_id: str) -> str:
     node_id = str(node_id or "").strip()
     if not node_id:
         raise ValueError("Node id is required")
+    if node_id in reserved_slot_candidate_ids():
+        raise RuntimeError("该候选已被普通槽位占用")
     stopped_existing = False
     with lock:
         if is_connecting:
@@ -2362,6 +2556,29 @@ def connect_node(node_id: str) -> str:
         with lock:
             is_connecting = False
 
+
+@_mutation_guard({"ok": False, "error_code": "operation_busy"})
+def disconnect_main_connection() -> dict[str, Any]:
+    global last_active_ping_time, last_active_latency
+    ui_cfg = load_ui_config()
+    ui_cfg["connection_enabled"] = False
+    _write_ui_config_atomic(ui_cfg)
+    stop_active_openvpn()
+    with lock:
+        nodes = read_nodes()
+        for item in nodes:
+            item["active"] = False
+        write_json(NODES_FILE, sort_all_nodes(nodes))
+    last_active_ping_time = 0.0
+    last_active_latency = 0
+    set_state(
+        active_openvpn_node_id="",
+        last_check_message="手动断开连接",
+        active_node_latency="无活动连接",
+    )
+    return {"ok": True}
+
+@_mutation_guard("operation_busy")
 def maintain_valid_nodes(force: bool = False) -> str:
     global active_openvpn_process, active_openvpn_node_id, is_connecting
     if not main_mutation_allowed():
@@ -2639,6 +2856,7 @@ def get_exit_slot_config() -> dict[str, Any]:
         "residential_only": bool(cfg.get("exit_slot_residential_only", True)),
     }
 
+@_mutation_guard({"ok": False, "error_code": "operation_busy"})
 def set_exit_slot_config(count: Any = None, country: Any = None, residential_only: Any = None, isp: Any = None) -> dict[str, Any]:
     if not main_mutation_allowed():
         return {"ok": False, "error_code": "operation_busy"}
@@ -2661,6 +2879,7 @@ def set_exit_slot_config(count: Any = None, country: Any = None, residential_onl
             print(f"[多出口] 保存槽位配置失败: {e}", flush=True)
     return get_exit_slot_config()
 
+@_mutation_guard({"ok": False, "error_code": "operation_busy"})
 def add_one_slot() -> dict[str, Any]:
     """新增一个空槽位：取最小可用索引加入启用列表。"""
     if not main_mutation_allowed():
@@ -2678,6 +2897,7 @@ def add_one_slot() -> dict[str, Any]:
     threading.Thread(target=supervise_exit_slots_once, daemon=True).start()
     return {"ok": True, "slot": free, "port": slot_port(free), "message": f"已新增槽位 #{free}（端口 {slot_port(free)}）"}
 
+@_mutation_guard({"ok": False, "error_code": "operation_busy"})
 def delete_slot(i: int) -> dict[str, Any]:
     """删除某槽位：拆除隧道/代理并从启用列表移除，同时清理该槽的锁定/地区/暂停记录。"""
     if not main_mutation_allowed():
@@ -2696,6 +2916,7 @@ def delete_slot(i: int) -> dict[str, Any]:
     write_slots_state()
     return {"ok": True, "slot": i, "message": f"已删除槽位 #{i}"}
 
+@_mutation_guard({"ok": False, "error_code": "operation_busy"})
 def stop_slot(i: int) -> dict[str, Any]:
     if not main_mutation_allowed():
         return {"ok": False, "error_code": "operation_busy"}
@@ -2711,6 +2932,7 @@ def stop_slot(i: int) -> dict[str, Any]:
     write_slots_state()
     return {"ok": True, "slot": i, "message": f"已停止槽位 #{i}"}
 
+@_mutation_guard({"ok": False, "error_code": "operation_busy"})
 def start_slot(i: int) -> dict[str, Any]:
     if not main_mutation_allowed():
         return {"ok": False, "error_code": "operation_busy"}
@@ -2752,7 +2974,7 @@ def safe_candidate_snapshot() -> list[dict[str, Any]]:
     )
     reserved = (
         {str(active_openvpn_node_id or "").strip()}
-        | current_slot_node_ids()
+        | reserved_slot_candidate_ids()
         | main_assignment_coordinator.reserved_candidate_ids()
     )
     reserved.discard("")
@@ -2783,6 +3005,7 @@ def get_slot_type_map() -> dict[str, str]:
 def per_slot_type(i: int) -> str:
     return get_slot_type_map().get(str(i), "")
 
+@_mutation_guard({"ok": False, "error_code": "operation_busy"})
 def set_slot_type(i: int, proxy_type: Any) -> dict[str, str]:
     normalized = normalize_proxy_type(proxy_type)
     if str(proxy_type or "").strip() and not normalized:
@@ -2813,6 +3036,7 @@ def per_slot_isp(i: int) -> str:
     """返回某槽位的运营商(ISP)过滤：优先用该槽位单独设定，否则回退到全局多出口 ISP 设置。"""
     return get_slot_isp_map().get(str(i), "") or get_exit_slot_config().get("isp", "")
 
+@_mutation_guard({"ok": False, "error_code": "operation_busy"})
 def set_slot_isp(i: int, isp: Any) -> dict[str, str]:
     with lock:
         auth_file = DATA_DIR / "ui_auth.json"
@@ -2840,6 +3064,7 @@ def get_slot_pin_map() -> dict[str, str]:
         return {}
     return {str(k): str(v) for k, v in raw.items() if v}
 
+@_mutation_guard({"ok": False, "error_code": "operation_busy"})
 def set_slot_pin(i: int, node_id: Any) -> dict[str, str]:
     with lock:
         auth_file = DATA_DIR / "ui_auth.json"
@@ -2860,6 +3085,7 @@ def set_slot_pin(i: int, node_id: Any) -> dict[str, str]:
             print(f"[多出口] 保存槽位锁定失败: {e}", flush=True)
     return get_slot_pin_map()
 
+@_mutation_guard({"ok": False, "error_code": "operation_busy"})
 def set_slot_country(i: int, country: Any) -> dict[str, str]:
     with lock:
         auth_file = DATA_DIR / "ui_auth.json"
@@ -2884,8 +3110,34 @@ def current_slot_node_ids() -> set[str]:
     with exit_slots_lock:
         return {s.get("node_id") for s in exit_slots.values() if s.get("node_id")}
 
+
+def reserved_slot_candidate_ids(*, exclude_slot: int | None = None) -> set[str]:
+    """返回普通槽位已运行或已 pin 的候选；可排除正在操作的槽位自身。"""
+    reserved = set(current_slot_node_ids())
+    pin_map = get_slot_pin_map()
+    if exclude_slot is not None:
+        with exit_slots_lock:
+            own_runtime = str(exit_slots.get(exclude_slot, {}).get("node_id") or "").strip()
+        if own_runtime:
+            reserved.discard(own_runtime)
+        own_pin = str(pin_map.get(str(exclude_slot)) or "").strip()
+        if own_pin:
+            reserved.discard(own_pin)
+    reserved.update(
+        str(node_id or "").strip()
+        for slot, node_id in pin_map.items()
+        if exclude_slot is None or str(slot) != str(exclude_slot)
+    )
+    reserved.discard("")
+    return reserved
+
 def pick_slot_node(i: int, used_ids: set[str]) -> dict[str, Any] | None:
     """为槽位 i 选节点：优先用户锁定(pin)的节点（仍可用且未被其他槽位占用），否则按本槽地区自动选最优。"""
+    used_ids = (
+        set(used_ids)
+        | reserved_slot_candidate_ids(exclude_slot=i)
+        | main_reserved_candidate_ids()
+    )
     pin = get_slot_pin_map().get(str(i))
     if pin and pin not in used_ids:
         node = next((n for n in read_nodes()
@@ -2912,6 +3164,7 @@ def select_slot_nodes(
     if proxy_type and not normalized_type:
         return []
     now = time.time()
+    used_ids = set(used_ids) | main_reserved_candidate_ids()
     bad = {nid for nid, until in slot_bad_nodes.items() if until > now}
     pool: list[dict[str, Any]] = []
     for n in read_nodes():
@@ -2945,7 +3198,14 @@ def ensure_slot_proxy(i: int) -> None:
         daemon=True,
     ).start()
 
+@_mutation_guard(False)
 def bring_up_slot(i: int, node: dict[str, Any]) -> bool:
+    candidate_id = str(node.get("id") or "").strip()
+    if candidate_id in (
+        main_reserved_candidate_ids()
+        | reserved_slot_candidate_ids(exclude_slot=i)
+    ):
+        return False
     dev = slot_device(i)
     cfg_path = slot_config_path(i)
     try:
@@ -3004,6 +3264,7 @@ def mark_slot_paused(i: int) -> None:
             "process": None, "status": "paused", "since": time.time(), "message": "已手动停止",
         }
 
+@_mutation_guard(None)
 def tear_down_slot(i: int, stop_proxy: bool = True) -> None:
     with exit_slots_lock:
         slot = exit_slots.pop(i, None)
@@ -3077,6 +3338,7 @@ def build_3xui_outbounds() -> dict[str, Any]:
         "routing": {"rules": rules},
     }
 
+@_mutation_guard(None)
 def supervise_exit_slots_once() -> None:
     if not main_mutation_allowed():
         return
@@ -3107,7 +3369,7 @@ def supervise_exit_slots_once() -> None:
             if slot_process_alive(i):
                 continue
             tear_down_slot(i, stop_proxy=False)  # 清理死进程/路由，保留已分配的代理端口
-            used = current_slot_node_ids()
+            used = reserved_slot_candidate_ids(exclude_slot=i)
             node = pick_slot_node(i, used)
             if node:
                 if not bring_up_slot(i, node):
@@ -3120,6 +3382,7 @@ def supervise_exit_slots_once() -> None:
     finally:
         exit_slots_supervise_lock.release()
 
+@_mutation_guard({"ok": False, "error_code": "operation_busy"})
 def switch_slot_node(i: int, lock_timeout: float = 0) -> dict[str, Any]:
     """手动为某槽位切换到另一个住宅节点（运营商/IP 质量不满意时重摇）。"""
     if not main_mutation_allowed():
@@ -3139,8 +3402,8 @@ def switch_slot_node(i: int, lock_timeout: float = 0) -> dict[str, Any]:
     try:
         # 手动换 IP 视为放弃锁定，清除该槽 pin，确保按地区切到“不同”节点
         set_slot_pin(i, "")
-        # 当前节点已在 exit_slots 中，current_slot_node_ids() 会把它纳入排除集，确保切到不同 IP
-        used = current_slot_node_ids()
+        # 当前节点仍在 runtime 保留集合中，确保本次会切到不同 IP。
+        used = reserved_slot_candidate_ids()
         proxy_type = per_slot_type(i)
         picks = select_slot_nodes(
             used, 1, per_slot_country(i), cfg["residential_only"] and not proxy_type,
@@ -3161,6 +3424,7 @@ def switch_slot_node(i: int, lock_timeout: float = 0) -> dict[str, Any]:
     finally:
         exit_slots_supervise_lock.release()
 
+@_mutation_guard({"ok": False, "error_code": "operation_busy"})
 def assign_node_to_slot(i: int, node_id: str) -> dict[str, Any]:
     """把指定节点(IP)分配到某个已存在的槽位并锁定，立即拨号。"""
     if not main_mutation_allowed():
@@ -3174,6 +3438,11 @@ def assign_node_to_slot(i: int, node_id: str) -> dict[str, Any]:
         return {"ok": False, "error": "未找到该节点"}
     if node.get("probe_status") != "available":
         return {"ok": False, "error": "该节点当前不可用，请先在列表中检测/更新"}
+    if node_id in (
+        main_reserved_candidate_ids()
+        | reserved_slot_candidate_ids(exclude_slot=i)
+    ):
+        return {"ok": False, "error_code": "candidate_in_use"}
     with exit_slots_lock:
         for idx, s in exit_slots.items():
             if idx != i and s.get("node_id") == node_id:
@@ -3197,6 +3466,7 @@ def assign_node_to_slot(i: int, node_id: str) -> dict[str, Any]:
     finally:
         exit_slots_supervise_lock.release()
 
+@_mutation_guard({"ok": False, "error_code": "operation_busy"})
 def add_slot_with_node(node_id: str) -> dict[str, Any]:
     """新增一个槽位并锁定到指定节点(IP)。"""
     if not main_mutation_allowed():
@@ -3207,6 +3477,8 @@ def add_slot_with_node(node_id: str) -> dict[str, Any]:
         return {"ok": False, "error": "未找到该节点"}
     if node.get("probe_status") != "available":
         return {"ok": False, "error": "该节点当前不可用，请先在列表中检测/更新"}
+    if node_id in (main_reserved_candidate_ids() | reserved_slot_candidate_ids()):
+        return {"ok": False, "error_code": "candidate_in_use"}
     with exit_slots_lock:
         for idx, s in exit_slots.items():
             if s.get("node_id") == node_id:
@@ -3272,6 +3544,7 @@ def managed_slots_snapshot() -> list[dict[str, Any]]:
         indices = sorted(exit_slots)
     return [snapshot for i in indices if (snapshot := managed_slot_snapshot(i)).get("ok")]
 
+@_mutation_guard({"ok": False, "error_code": "operation_busy"})
 def assign_managed_slot(i: int, node_id: str, country: str = "", proxy_type: str = "") -> dict[str, Any]:
     """将一个可用候选装载到指定受管槽位，并在失败时恢复原节点和筛选元数据。"""
     if not main_mutation_allowed():
@@ -3287,6 +3560,11 @@ def assign_managed_slot(i: int, node_id: str, country: str = "", proxy_type: str
         return {"ok": False, "error_code": "slot_not_found" if slot not in active else "candidate_not_found"}
     if node.get("probe_status") != "available":
         return {"ok": False, "error_code": "candidate_unavailable"}
+    if node_id in (
+        main_reserved_candidate_ids()
+        | reserved_slot_candidate_ids(exclude_slot=slot)
+    ):
+        return {"ok": False, "error_code": "candidate_in_use"}
     normalized_country = str(country or node.get("country_short") or "").strip().upper()
     normalized_type = normalize_proxy_type(proxy_type or node.get("proxy_type") or node.get("ip_type"))
     if not re.fullmatch(r"[A-Z]{2}", normalized_country) or not normalized_type:
@@ -3320,6 +3598,7 @@ def assign_managed_slot(i: int, node_id: str, country: str = "", proxy_type: str
             return {"ok": False, "error_code": "rollback_failed"}
     return {"ok": False, "error_code": "assign_failed"}
 
+@_mutation_guard({"ok": False, "error_code": "operation_busy"})
 def create_managed_slot(country: str, proxy_type: str, candidate_id: str = "") -> dict[str, Any]:
     if not main_mutation_allowed():
         return {"ok": False, "error_code": "operation_busy"}
@@ -3328,7 +3607,7 @@ def create_managed_slot(country: str, proxy_type: str, candidate_id: str = "") -
     if not re.fullmatch(r"[A-Z]{2}", country) or not normalized_type:
         return {"ok": False, "error_code": "invalid_request"}
     candidate_id = str(candidate_id or "").strip()
-    used_ids = current_slot_node_ids()
+    used_ids = reserved_slot_candidate_ids() | main_reserved_candidate_ids()
     if candidate_id:
         candidate = next((node for node in read_nodes() if str(node.get("id") or "") == candidate_id), None)
         if candidate is None or candidate.get("probe_status") != "available":
@@ -3365,6 +3644,7 @@ def create_managed_slot(country: str, proxy_type: str, candidate_id: str = "") -
             return {"ok": False, "error_code": "slot_configuration_failed"}
     return {"ok": False, "error_code": "slot_create_failed"}
 
+@_mutation_guard({"ok": False, "error_code": "operation_busy"})
 def rotate_managed_slot(i: int) -> dict[str, Any]:
     if not main_mutation_allowed():
         return {"ok": False, "error_code": "operation_busy"}
@@ -3374,6 +3654,7 @@ def rotate_managed_slot(i: int) -> dict[str, Any]:
             return managed_slot_snapshot(i)
     return {"ok": False, "error_code": "slot_rotate_failed"}
 
+@_mutation_guard({"ok": False, "error_code": "operation_busy"})
 def check_managed_slot(i: int) -> dict[str, Any]:
     snapshot = managed_slot_snapshot(i)
     if not snapshot.get("ok"):
@@ -3393,6 +3674,7 @@ def check_managed_slot(i: int) -> dict[str, Any]:
     snapshot["checked_at"] = checked_at
     return snapshot
 
+@_mutation_guard({"ok": False, "error_code": "operation_busy"})
 def delete_managed_slot(i: int) -> dict[str, Any]:
     if not main_mutation_allowed():
         return {"ok": False, "error_code": "operation_busy"}
@@ -7631,24 +7913,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/disconnect":
             try:
-                ui_cfg = load_ui_config()
-                ui_cfg["connection_enabled"] = False
-                auth_file = DATA_DIR / "ui_auth.json"
-                with lock:
-                    DATA_DIR.mkdir(exist_ok=True, parents=True)
-                    auth_file.write_text(json.dumps(ui_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-                
-                stop_active_openvpn()
-                with lock:
-                    nodes = read_nodes()
-                    for item in nodes:
-                        item["active"] = False
-                    write_json(NODES_FILE, sort_all_nodes(nodes))
-                global last_active_ping_time, last_active_latency
-                last_active_ping_time = 0.0
-                last_active_latency = 0
-                set_state(active_openvpn_node_id="", last_check_message="手动断开连接", active_node_latency="无活动连接")
-                self.send_json({"ok": True})
+                result = disconnect_main_connection()
+                self.send_json(result)
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/connect":

@@ -31,6 +31,11 @@ CAPABILITIES = [
     "main.assign",
     "main.assign.commit",
     "main.assign.rollback",
+    "main.assign.repair-commit",
+    "main.assign.repair-replace",
+    "mutation-leases.acquire",
+    "mutation-leases.renew",
+    "mutation-leases.release",
     "admin.read",
     "admin.verify",
     "admin.update",
@@ -107,21 +112,31 @@ class ControlHandler(BaseHTTPRequestHandler):
     @staticmethod
     def _main_assignment_action(path: str) -> tuple[str, str] | None:
         match = re.fullmatch(
-            r"/control/v1/main/assign/([A-Za-z0-9_-]{8,128})/(commit|rollback)",
+            r"/control/v1/main/assign/([A-Za-z0-9_-]{8,128})/(commit|rollback|repair-commit|repair-replace)",
             path,
         )
         if not match:
             return None
         return match.group(1), match.group(2)
 
+    @staticmethod
+    def _mutation_lease_action(path: str) -> tuple[str, str] | None:
+        match = re.fullmatch(
+            r"/control/v1/mutation-leases/([A-Za-z0-9_-]{32,128})(?:/(renew))?",
+            path,
+        )
+        if not match:
+            return None
+        return match.group(1), match.group(2) or "release"
+
     def _manager_result(self, result: Any, success: HTTPStatus = HTTPStatus.OK) -> None:
         if isinstance(result, dict) and result.get("ok") is False:
             code = str(result.get("error_code") or "operation_failed")
-            if code in ("slot_not_found", "candidate_not_found", "operation_not_found"):
+            if code in ("slot_not_found", "candidate_not_found", "operation_not_found", "lease_not_found"):
                 status = HTTPStatus.NOT_FOUND
             elif code in ("invalid_request", "candidate_mismatch"):
                 status = HTTPStatus.BAD_REQUEST
-            elif code == "rollback_failed":
+            elif code in ("rollback_failed", "repair_commit_failed", "repair_replace_failed"):
                 status = HTTPStatus.SERVICE_UNAVAILABLE
             else:
                 status = HTTPStatus.CONFLICT
@@ -159,6 +174,29 @@ class ControlHandler(BaseHTTPRequestHandler):
             result.pop("ok", None)
             self._send_json(HTTPStatus.OK, {"data": result})
             return
+        if self.command == "POST" and path == f"{API_PREFIX}/mutation-leases":
+            payload = self._read_object({"idempotencyKey"})
+            idempotency_key = str(payload.get("idempotencyKey") or "")
+            if (
+                not 8 <= len(idempotency_key) <= 256
+                or any(ord(character) < 0x21 or ord(character) > 0x7E for character in idempotency_key)
+            ):
+                raise ValueError("invalid request")
+            self._manager_result(
+                self.server.manager.acquire_mutation_lease(idempotency_key),
+                HTTPStatus.CREATED,
+            )
+            return
+        mutation_lease_action = self._mutation_lease_action(path)
+        if mutation_lease_action:
+            lease_id, action = mutation_lease_action
+            if self.command == "POST" and action == "renew":
+                self._read_object(set())
+                self._manager_result(self.server.manager.renew_mutation_lease(lease_id))
+                return
+            if self.command == "DELETE" and action == "release":
+                self._manager_result(self.server.manager.release_mutation_lease(lease_id))
+                return
         if self.command == "POST" and path == f"{API_PREFIX}/main/assign":
             payload = self._read_object(
                 {
@@ -196,13 +234,35 @@ class ControlHandler(BaseHTTPRequestHandler):
             return
         main_action = self._main_assignment_action(path)
         if self.command == "POST" and main_action:
-            self._read_object(set())
             operation_id, action = main_action
-            method = (
-                self.server.manager.commit_main_assignment
-                if action == "commit"
-                else self.server.manager.rollback_main_assignment
-            )
+            if action == "repair-replace":
+                payload = self._read_object({"candidateId", "country", "proxyType"})
+                candidate_id = str(payload.get("candidateId") or "").strip()
+                country = str(payload.get("country") or "").strip().upper()
+                proxy_type = str(payload.get("proxyType") or "").strip().lower()
+                if (
+                    not candidate_id
+                    or len(candidate_id) > 256
+                    or not re.fullmatch(r"[A-Z]{2}", country)
+                    or proxy_type not in ("residential", "datacenter")
+                ):
+                    raise ValueError("invalid request")
+                self._manager_result(
+                    self.server.manager.repair_replace_main_assignment(
+                        operation_id,
+                        candidate_id,
+                        country,
+                        proxy_type,
+                    )
+                )
+                return
+            self._read_object(set())
+            methods = {
+                "commit": self.server.manager.commit_main_assignment,
+                "rollback": self.server.manager.rollback_main_assignment,
+                "repair-commit": self.server.manager.repair_commit_main_assignment,
+            }
+            method = methods[action]
             self._manager_result(method(operation_id))
             return
         if self.command == "GET" and path == f"{API_PREFIX}/candidates/countries":

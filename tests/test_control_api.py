@@ -17,6 +17,9 @@ class FakeManager:
         self.main_assignments = []
         self.main_commits = []
         self.main_rollbacks = []
+        self.main_repair_commits = []
+        self.main_repair_replacements = []
+        self.mutation_leases = []
         self.main_assignment_result = {
             "ok": True,
             "operation_id": "operation-safe-1",
@@ -62,6 +65,37 @@ class FakeManager:
     def rollback_main_assignment(self, operation_id):
         self.main_rollbacks.append(operation_id)
         return dict(self.main_assignment_result, state="rolled_back")
+
+    def repair_commit_main_assignment(self, operation_id):
+        self.main_repair_commits.append(operation_id)
+        return dict(
+            self.main_assignment_result,
+            state="pending_gateway_validation",
+            resolution="repair_commit",
+        )
+
+    def repair_replace_main_assignment(self, operation_id, candidate_id, country, proxy_type):
+        self.main_repair_replacements.append(
+            (operation_id, candidate_id, country, proxy_type)
+        )
+        return dict(
+            self.main_assignment_result,
+            state="pending_gateway_validation",
+            new_candidate_id=candidate_id,
+            resolution="repair_replace",
+        )
+
+    def acquire_mutation_lease(self, idempotency_key):
+        self.mutation_leases.append(("acquire", idempotency_key))
+        return {"ok": True, "state": "active", "lease_id": "opaque-lease-id-00000000000000000001", "expires_at": 1_700_000_060}
+
+    def renew_mutation_lease(self, lease_id):
+        self.mutation_leases.append(("renew", lease_id))
+        return {"ok": True, "state": "active", "lease_id": lease_id, "expires_at": 1_700_000_120}
+
+    def release_mutation_lease(self, lease_id):
+        self.mutation_leases.append(("release", lease_id))
+        return {"ok": True, "state": "released"}
 
     def country_catalog_snapshot(self):
         return [
@@ -182,6 +216,11 @@ class ControlAPITests(unittest.TestCase):
                 "main.assign",
                 "main.assign.commit",
                 "main.assign.rollback",
+                "main.assign.repair-commit",
+                "main.assign.repair-replace",
+                "mutation-leases.acquire",
+                "mutation-leases.renew",
+                "mutation-leases.release",
                 "admin.read",
                 "admin.verify",
                 "admin.update",
@@ -232,6 +271,27 @@ class ControlAPITests(unittest.TestCase):
         for forbidden in ["password", "token", "config", "cookie", "private"]:
             self.assertNotIn(forbidden, serialized)
 
+        status, _, payload = self.request(
+            "POST", "/control/v1/main/assign/operation-safe-1/repair-commit", {}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["data"]["state"], "pending_gateway_validation")
+        self.assertEqual(payload["data"]["resolution"], "repair_commit")
+        self.assertEqual(self.manager.main_repair_commits, ["operation-safe-1"])
+
+        status, _, payload = self.request(
+            "POST",
+            "/control/v1/main/assign/operation-safe-1/repair-replace",
+            {"candidateId": "replacement-safe", "country": "kr", "proxyType": "residential"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["data"]["state"], "pending_gateway_validation")
+        self.assertEqual(payload["data"]["resolution"], "repair_replace")
+        self.assertEqual(
+            self.manager.main_repair_replacements,
+            [("operation-safe-1", "replacement-safe", "KR", "residential")],
+        )
+
     def test_main_assignment_rejects_unknown_fields_and_maps_busy(self):
         request = {
             "candidateId": "node-safe",
@@ -277,6 +337,44 @@ class ControlAPITests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(payload["data"]["state"], "repair_required")
         self.assertNotIn("ok", payload["data"])
+
+    def test_mutation_lease_uses_closed_acquire_renew_release_routes(self):
+        status, _, acquired = self.request(
+            "POST",
+            "/control/v1/mutation-leases",
+            {"idempotencyKey": "gateway-protocol-operation"},
+        )
+        self.assertEqual(status, 201)
+        lease_id = acquired["data"]["lease_id"]
+        self.assertEqual(acquired["data"]["state"], "active")
+
+        status, _, renewed = self.request(
+            "POST", f"/control/v1/mutation-leases/{lease_id}/renew", {}
+        )
+        self.assertEqual(status, 200)
+        self.assertGreater(renewed["data"]["expires_at"], acquired["data"]["expires_at"])
+
+        status, _, released = self.request(
+            "DELETE", f"/control/v1/mutation-leases/{lease_id}"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(released, {"data": {"state": "released"}})
+        self.assertEqual(
+            self.manager.mutation_leases,
+            [
+                ("acquire", "gateway-protocol-operation"),
+                ("renew", lease_id),
+                ("release", lease_id),
+            ],
+        )
+
+        status, _, payload = self.request(
+            "POST",
+            "/control/v1/mutation-leases",
+            {"idempotencyKey": "gateway-protocol-operation", "ttl": 999},
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload, {"error": {"code": "invalid_request"}})
 
     def test_country_catalog_and_refresh_use_a_closed_safe_contract(self):
         status, _, payload = self.request("GET", "/control/v1/candidates/countries")
