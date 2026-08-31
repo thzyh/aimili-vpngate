@@ -76,6 +76,38 @@ class MainAssignmentCoordinatorTests(unittest.TestCase):
         values.update(overrides)
         return self.coordinator.stage(**values)
 
+    def legacy_terminal_document(self) -> dict:
+        path = Path(self.temp.name) / "legacy-terminal-source.json"
+        operation_counter = iter(range(1, 8))
+        coordinator = MainAssignmentCoordinator(
+            path,
+            now=lambda: self.clock[0],
+            operation_id_factory=lambda: f"legacy-terminal-op-{next(operation_counter)}",
+        )
+        for index in range(7):
+            result = coordinator.stage(
+                candidate_id=f"candidate-{index}",
+                country="JP",
+                proxy_type="datacenter",
+                expected_current_candidate_id="old-main",
+                idempotency_key=f"legacy-terminal-key-{index}",
+                current=current_snapshot(),
+                slot_candidate_ids=set(),
+                stage_candidate=lambda _candidate: {
+                    "dns_verified": True,
+                    "exit_verified": True,
+                    "available": True,
+                },
+                restore_previous=self.executor.restore,
+            )
+            if index < 5:
+                coordinator.commit(result["operation_id"])
+            else:
+                coordinator.rollback(result["operation_id"], self.executor.restore)
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document.pop("mutation_lease")
+        return document
+
     def test_successful_stage_is_pending_until_commit(self):
         result = self.stage()
 
@@ -573,6 +605,97 @@ class MainAssignmentCoordinatorTests(unittest.TestCase):
         self.assertFalse(coordinator.mutation_allowed())
         stored = json.loads(self.path.read_text(encoding="utf-8"))
         self.assertEqual(stored["mutation_lease"], {})
+
+    def test_legacy_terminal_repair_resolutions_are_canonically_migrated(self):
+        legacy = self.legacy_terminal_document()
+        committed = [
+            operation
+            for operation in legacy["operations"].values()
+            if operation["state"] == "committed"
+        ]
+        committed[0]["resolution"] = "committed_new_after_repair"
+        committed[1]["resolution"] = "replaced_after_repair"
+        self.path.write_text(json.dumps(legacy), encoding="utf-8")
+
+        coordinator = MainAssignmentCoordinator(self.path)
+
+        self.assertEqual(coordinator.snapshot(), {"ok": True, "state": "idle"})
+        self.assertTrue(coordinator.mutation_allowed())
+        stored = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertIsNone(stored["mutation_lease"])
+        self.assertEqual(len(stored["operations"]), 7)
+        self.assertEqual(
+            {operation["state"] for operation in stored["operations"].values()},
+            {"committed", "rolled_back"},
+        )
+        self.assertFalse(
+            any("resolution" in operation for operation in stored["operations"].values())
+        )
+        self.assertFalse(self.path.with_suffix(".json.tmp").exists())
+
+    def test_legacy_resolution_compatibility_rejects_nonterminal_or_invalid_records(self):
+        cases = {}
+
+        active = self.legacy_terminal_document()
+        active_operation = next(iter(active["operations"].values()))
+        active_operation["resolution"] = "committed_new_after_repair"
+        active["active"] = dict(active_operation)
+        cases["active"] = active
+
+        pending = self.legacy_terminal_document()
+        pending_operation = next(iter(pending["operations"].values()))
+        pending_operation["state"] = "pending_commit"
+        pending_operation["resolution"] = "committed_new_after_repair"
+        pending["active"] = dict(pending_operation)
+        cases["pending"] = pending
+
+        repairing = self.legacy_terminal_document()
+        repairing_operation = next(iter(repairing["operations"].values()))
+        repairing_operation["state"] = "repairing"
+        repairing_operation["resolution"] = "replaced_after_repair"
+        repairing["active"] = dict(repairing_operation)
+        cases["repairing"] = repairing
+
+        rolled_back = self.legacy_terminal_document()
+        rolled_back_operation = next(
+            operation
+            for operation in rolled_back["operations"].values()
+            if operation["state"] == "rolled_back"
+        )
+        rolled_back_operation["resolution"] = "committed_new_after_repair"
+        cases["rolled_back"] = rolled_back
+
+        unknown = self.legacy_terminal_document()
+        next(iter(unknown["operations"].values()))["resolution"] = "unknown_resolution"
+        cases["unknown"] = unknown
+
+        bad_hash = self.legacy_terminal_document()
+        bad_hash_operation = next(iter(bad_hash["operations"].values()))
+        bad_hash_operation["resolution"] = "committed_new_after_repair"
+        bad_hash_operation["repair_request_hash"] = "not-a-valid-hash"
+        cases["bad_hash"] = bad_hash
+
+        for name, payload in cases.items():
+            with self.subTest(name=name):
+                path = Path(self.temp.name) / f"legacy-terminal-invalid-{name}.json"
+                original = json.dumps(payload, sort_keys=True)
+                path.write_text(original, encoding="utf-8")
+
+                coordinator = MainAssignmentCoordinator(path)
+
+                self.assertEqual(
+                    coordinator.snapshot(),
+                    {
+                        "ok": False,
+                        "state": "repair_required",
+                        "error_code": "state_corrupt",
+                    },
+                )
+                self.assertFalse(coordinator.mutation_allowed())
+                self.assertEqual(
+                    json.dumps(json.loads(path.read_text(encoding="utf-8")), sort_keys=True),
+                    original,
+                )
 
     def test_external_mutation_lease_is_finite_idempotent_and_fail_closed(self):
         acquire = getattr(self.coordinator, "acquire_mutation_lease", None)

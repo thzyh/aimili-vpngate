@@ -28,6 +28,10 @@ _BLOCKING_STATES = {
 _OPERATION_STATES = _BLOCKING_STATES | {"committed", "rolled_back"}
 _ACTIVE_OPERATION_STATES = set(_BLOCKING_STATES)
 _LEASE_STATES = {"active", "released", "expired"}
+_LEGACY_TERMINAL_RESOLUTIONS = {
+    "committed_new_after_repair",
+    "replaced_after_repair",
+}
 _OPERATION_REQUIRED_FIELDS = {
     "ok",
     "operation_id",
@@ -520,9 +524,48 @@ class MainAssignmentCoordinator:
                 if self._valid_document(migrated):
                     self._state_migration_required = True
                     return migrated
+                migrated = self._canonicalize_legacy_terminal_history(raw)
+                if migrated is not None and self._valid_document(migrated):
+                    self._state_migration_required = True
+                    return migrated
         except (json.JSONDecodeError, KeyError, OverflowError, TypeError, ValueError):
             pass
         return self._corrupt_state()
+
+    @classmethod
+    def _canonicalize_legacy_terminal_history(
+        cls,
+        raw: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if raw.get("active") is not None or not isinstance(raw.get("operations"), dict):
+            return None
+        operations: dict[str, Any] = {}
+        canonicalized = False
+        for history_key, stored in raw["operations"].items():
+            if not isinstance(stored, dict) or stored.get("state") not in {
+                "committed",
+                "rolled_back",
+            }:
+                return None
+            operation = dict(stored)
+            resolution = operation.get("resolution")
+            if resolution in _LEGACY_TERMINAL_RESOLUTIONS:
+                if (
+                    operation.get("state") != "committed"
+                    or "repair_request_hash" in operation
+                ):
+                    return None
+                operation.pop("resolution")
+                canonicalized = True
+            operations[history_key] = operation
+        if not canonicalized:
+            return None
+        return {
+            "version": raw.get("version"),
+            "active": None,
+            "operations": operations,
+            "mutation_lease": None,
+        }
 
     @classmethod
     def _valid_document(cls, raw: Any) -> bool:
