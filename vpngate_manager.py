@@ -560,7 +560,7 @@ def safe_main_status() -> dict[str, Any]:
         "candidate_id": active_id,
         "country": str(active.get("country_short") or active.get("country") or "").upper() if active else "",
         "country_name": str(active.get("country") or "") if active else "",
-        "proxy_type": str(active.get("proxy_type") or "") if active else "",
+        "proxy_type": normalize_proxy_type(active.get("ip_type")) if active else "",
         "exit_ip": str(state.get("proxy_ip") or "") if state.get("proxy_ok") else "",
         "port": int(state.get("proxy_port") or LOCAL_PROXY_PORT),
         "egress_ok": bool(state.get("proxy_ok")),

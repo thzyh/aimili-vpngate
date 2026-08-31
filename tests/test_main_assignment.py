@@ -875,6 +875,19 @@ class ManagerMainAssignmentTests(unittest.TestCase):
         self.assertEqual(status["candidate_id"], "new-main")
         self.assertNotIn("config_text", status)
 
+    def test_safe_main_status_normalizes_real_node_ip_type(self):
+        with (
+            mock.patch.object(manager, "read_nodes", return_value=self.nodes),
+            mock.patch.object(
+                manager,
+                "get_state",
+                return_value={"proxy_ok": True, "proxy_ip": "198.51.100.90", "proxy_port": 7928},
+            ),
+        ):
+            status = manager.safe_main_status()
+
+        self.assertEqual(status["proxy_type"], "datacenter")
+
     def test_manager_rollback_reconnects_previous_main_and_restores_settings(self):
         settings = {
             "connection_enabled": True,
