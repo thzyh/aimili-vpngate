@@ -1,5 +1,7 @@
 # AimiliVPN · 多出口增强版 (Multi-Exit Edition) 🌐
 
+2026-08-31 增量把本地代理容量限制为默认全局 24、每监听实例 6，并补齐 OpenVPN 日志线程/策略路由失败回收、精确槽位孤儿清理和固定 30 条有效节点缓存。单国补充会保留其他国家并立即重平衡；安全元数据持久化在 `pool_metadata.json`，不保存节点配置正文或认证材料。
+
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![Zero-Dependency](https://img.shields.io/badge/依赖-零第三方库-success?style=flat-square)](#)
 [![Platform](https://img.shields.io/badge/平台-Linux%20VPS-1f6feb?style=flat-square&logo=linux&logoColor=white)](#)
