@@ -1477,6 +1477,55 @@ class ManagerMainAssignmentTests(unittest.TestCase):
 
         recover.assert_called_once_with()
 
+    def test_startup_bootstrap_recovers_transaction_before_reusing_active_main(self):
+        events = []
+        manager.active_openvpn_node_id = ""
+        manager.is_connecting = True
+
+        def recover():
+            events.append("recover")
+            return {"ok": True, "state": "idle"}
+
+        def connect(candidate_id):
+            events.append("connect:" + candidate_id)
+            manager.active_openvpn_node_id = candidate_id
+            manager.is_connecting = False
+
+        nodes = [dict(self.nodes[0], active=True), dict(self.nodes[1], active=False)]
+        with (
+            mock.patch.object(manager, "recover_main_assignment", side_effect=recover),
+            mock.patch.object(manager, "active_openvpn_running", return_value=False),
+            mock.patch.object(manager, "read_nodes", return_value=nodes),
+            mock.patch.object(manager, "reserved_slot_candidate_ids", return_value={"slot-node"}),
+            mock.patch.object(
+                manager,
+                "load_ui_config",
+                return_value={"connection_enabled": True, "routing_mode": "auto"},
+            ),
+            mock.patch.object(manager, "connect_node", side_effect=connect),
+        ):
+            result = manager.bootstrap_main_connection()
+
+        self.assertEqual(events, ["recover", "connect:old-main"])
+        self.assertEqual(result, {"ok": True, "state": "connected"})
+        self.assertEqual(manager.active_openvpn_node_id, "old-main")
+        self.assertFalse(manager.is_connecting)
+
+    def test_startup_bootstrap_does_not_connect_while_transaction_needs_repair(self):
+        manager.active_openvpn_node_id = ""
+        manager.is_connecting = True
+        unresolved = {"ok": False, "state": "repair_required", "error_code": "rollback_failed"}
+        with (
+            mock.patch.object(manager, "recover_main_assignment", return_value=unresolved),
+            mock.patch.object(manager, "connect_node", side_effect=AssertionError("must not connect")),
+            mock.patch.object(manager, "auto_switch_node", side_effect=AssertionError("must not switch")),
+        ):
+            result = manager.bootstrap_main_connection()
+
+        self.assertEqual(result, unresolved)
+        self.assertEqual(manager.active_openvpn_node_id, "")
+        self.assertTrue(manager.is_connecting)
+
     def test_active_main_stage_lease_blocks_low_level_disconnect(self):
         entered = threading.Event()
         release = threading.Event()

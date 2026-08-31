@@ -896,6 +896,48 @@ def main_assignment_recovery_loop() -> None:
         recover_main_assignment()
         time.sleep(5)
 
+
+def bootstrap_main_connection() -> dict[str, Any]:
+    """Recover a persisted transaction, then restore the last healthy main before pool maintenance."""
+    global is_connecting
+    recovery = recover_main_assignment()
+    if recovery.get("state") != "idle":
+        return recovery
+    if active_openvpn_running():
+        return {"ok": True, "state": "active"}
+
+    ui_cfg = load_ui_config()
+    if not ui_cfg.get("connection_enabled", True):
+        with lock:
+            is_connecting = False
+        return {"ok": True, "state": "disabled"}
+
+    reserved = reserved_slot_candidate_ids()
+    preferred = next(
+        (
+            node
+            for node in read_nodes()
+            if node.get("active")
+            and node.get("probe_status") == "available"
+            and str(node.get("id") or "").strip() not in reserved
+        ),
+        None,
+    )
+    with lock:
+        is_connecting = False
+    if preferred is not None:
+        try:
+            connect_node(str(preferred.get("id") or ""))
+            return {"ok": True, "state": "connected"}
+        except Exception as exc:
+            log_to_json("WARNING", "VPN", f"启动时恢复旧主连接失败，将使用健康候选回退: {exc}")
+    auto_switch_node()
+    connected = active_openvpn_running()
+    return {
+        "ok": bool(connected),
+        "state": "connected" if connected else "pending",
+    }
+
 def safe_name(value: str) -> str:
     value = re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip())
     return value.strip("._") or "node"
@@ -8253,7 +8295,8 @@ def main() -> None:
     else:
         print("[警告] 代理网关启动超时，继续执行脚本...", flush=True)
 
-    # 主事务恢复必须先于其他会改变节点/槽位的后台任务启动。
+    # 主事务恢复和旧健康主连接复用必须先于其他会改变节点/槽位的后台任务启动。
+    bootstrap_main_connection()
     threading.Thread(target=main_assignment_recovery_loop, daemon=True).start()
     threading.Thread(target=collector_loop, daemon=True).start()
     threading.Thread(target=background_proxy_checker, daemon=True).start()
