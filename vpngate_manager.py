@@ -3257,9 +3257,49 @@ def current_slot_node_ids() -> set[str]:
         return {s.get("node_id") for s in exit_slots.values() if s.get("node_id")}
 
 
+def persisted_slot_node_ids(*, exclude_slot: int | None = None) -> set[str]:
+    """Return enabled slot identities saved before this process rebuilt runtime state."""
+    document = read_json(SLOTS_FILE, {"slots": []})
+    rows = document.get("slots") if isinstance(document, dict) else []
+    if not isinstance(rows, list):
+        return set()
+    active_slots = set(get_active_slots())
+    result: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            slot = int(row.get("slot"))
+        except (TypeError, ValueError):
+            continue
+        if slot not in active_slots or slot == exclude_slot:
+            continue
+        node_id = str(row.get("node_id") or "").strip()
+        if node_id:
+            result.add(node_id)
+    return result
+
+
+def persisted_slot_node_id(slot: int) -> str:
+    document = read_json(SLOTS_FILE, {"slots": []})
+    rows = document.get("slots") if isinstance(document, dict) else []
+    if not isinstance(rows, list):
+        return ""
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            row_slot = int(row.get("slot"))
+        except (TypeError, ValueError):
+            continue
+        if row_slot == slot:
+            return str(row.get("node_id") or "").strip()
+    return ""
+
+
 def reserved_slot_candidate_ids(*, exclude_slot: int | None = None) -> set[str]:
     """返回普通槽位已运行或已 pin 的候选；可排除正在操作的槽位自身。"""
-    reserved = set(current_slot_node_ids())
+    reserved = set(current_slot_node_ids()) | persisted_slot_node_ids(exclude_slot=exclude_slot)
     pin_map = get_slot_pin_map()
     if exclude_slot is not None:
         with exit_slots_lock:
@@ -3288,6 +3328,12 @@ def pick_slot_node(i: int, used_ids: set[str]) -> dict[str, Any] | None:
     if pin and pin not in used_ids:
         node = next((n for n in read_nodes()
                      if n.get("id") == pin and n.get("probe_status") == "available"), None)
+        if node:
+            return node
+    persisted = persisted_slot_node_id(i)
+    if persisted and persisted not in used_ids:
+        node = next((n for n in read_nodes()
+                     if n.get("id") == persisted and n.get("probe_status") == "available"), None)
         if node:
             return node
     cfg = get_exit_slot_config()

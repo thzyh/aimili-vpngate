@@ -1228,6 +1228,68 @@ class ManagerMainAssignmentTests(unittest.TestCase):
 
         self.assertEqual(candidates, [])
 
+    def test_persisted_slot_candidates_are_reserved_before_runtime_rebuild(self):
+        slots_path = Path(self.temp.name) / "slots.json"
+        slots_path.write_text(
+            json.dumps(
+                {
+                    "slots": [
+                        {"slot": 0, "node_id": "persisted-slot-zero"},
+                        {"slot": 1, "node_id": "persisted-slot-one"},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        with (
+            mock.patch.object(manager, "SLOTS_FILE", slots_path),
+            mock.patch.object(manager, "get_active_slots", return_value=[0, 1]),
+            mock.patch.object(manager, "current_slot_node_ids", return_value=set()),
+            mock.patch.object(manager, "get_slot_pin_map", return_value={}),
+        ):
+            self.assertEqual(
+                manager.reserved_slot_candidate_ids(),
+                {"persisted-slot-zero", "persisted-slot-one"},
+            )
+            self.assertEqual(
+                manager.reserved_slot_candidate_ids(exclude_slot=0),
+                {"persisted-slot-one"},
+            )
+
+    def test_slot_rebuild_prefers_its_own_persisted_healthy_candidate(self):
+        slots_path = Path(self.temp.name) / "slots.json"
+        slots_path.write_text(
+            json.dumps({"slots": [{"slot": 0, "node_id": "persisted-slot-zero"}]}),
+            encoding="utf-8",
+        )
+        candidates = [
+            {
+                "id": "lower-latency-new",
+                "probe_status": "available",
+                "country_short": "US",
+                "ip_type": "residential",
+                "latency_ms": 1,
+            },
+            {
+                "id": "persisted-slot-zero",
+                "probe_status": "available",
+                "country_short": "US",
+                "ip_type": "residential",
+                "latency_ms": 50,
+            },
+        ]
+        with (
+            mock.patch.object(manager, "SLOTS_FILE", slots_path),
+            mock.patch.object(manager, "get_active_slots", return_value=[0]),
+            mock.patch.object(manager, "current_slot_node_ids", return_value=set()),
+            mock.patch.object(manager, "get_slot_pin_map", return_value={}),
+            mock.patch.object(manager, "read_nodes", return_value=candidates),
+            mock.patch.object(manager, "main_reserved_candidate_ids", return_value=set()),
+        ):
+            selected = manager.pick_slot_node(0, set())
+
+        self.assertEqual(selected["id"], "persisted-slot-zero")
+
     def test_mutating_facades_refuse_work_during_pending_main_assignment(self):
         with mock.patch.object(
             manager.main_assignment_coordinator,
