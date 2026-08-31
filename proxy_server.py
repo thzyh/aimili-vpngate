@@ -16,8 +16,45 @@ def parse_positive_int(value: str | None, default: int) -> int:
     except (TypeError, ValueError):
         return default
 
-MAX_PROXY_CONNECTIONS = parse_positive_int(os.environ.get("LOCAL_PROXY_MAX_CONNECTIONS"), 256)
-proxy_connection_sem = threading.BoundedSemaphore(MAX_PROXY_CONNECTIONS)
+MAX_PROXY_CONNECTIONS = parse_positive_int(os.environ.get("LOCAL_PROXY_MAX_CONNECTIONS"), 24)
+MAX_PROXY_CONNECTIONS_PER_LISTENER = parse_positive_int(
+    os.environ.get("LOCAL_PROXY_MAX_CONNECTIONS_PER_LISTENER"), 6
+)
+
+
+class ProxyCapacity:
+    """Apply a process-wide budget and an independent budget per listener."""
+
+    def __init__(self, global_limit: int, per_listener_limit: int) -> None:
+        self.global_limit = max(1, global_limit)
+        self.per_listener_limit = max(1, min(per_listener_limit, self.global_limit))
+        self._global = threading.BoundedSemaphore(self.global_limit)
+        self._listeners: dict[str, threading.BoundedSemaphore] = {}
+        self._lock = threading.Lock()
+
+    def _listener(self, listener_key: str) -> threading.BoundedSemaphore:
+        with self._lock:
+            return self._listeners.setdefault(
+                listener_key, threading.BoundedSemaphore(self.per_listener_limit)
+            )
+
+    def try_acquire(self, listener_key: str) -> bool:
+        listener = self._listener(listener_key)
+        if not listener.acquire(blocking=False):
+            return False
+        if self._global.acquire(blocking=False):
+            return True
+        listener.release()
+        return False
+
+    def release(self, listener_key: str) -> None:
+        self._global.release()
+        self._listener(listener_key).release()
+
+
+proxy_capacity = ProxyCapacity(
+    MAX_PROXY_CONNECTIONS, MAX_PROXY_CONNECTIONS_PER_LISTENER
+)
 
 class ConnRegistry:
     """跟踪某个代理监听实例当前活跃的下游客户端连接，支持一次性强制断开。
@@ -526,7 +563,45 @@ def proxy_client(client: socket.socket, address: tuple[str, int], device: str = 
         except OSError:
             pass
 
-def start_proxy_server(host: str, port: int, device: str = "tun0", stop_event: threading.Event | None = None, registry: ConnRegistry | None = None) -> None:
+def start_proxy_client_thread(
+    client: socket.socket,
+    address: tuple[str, int],
+    device: str,
+    listener_key: str,
+    capacity: ProxyCapacity,
+    registry: ConnRegistry | None = None,
+    thread_factory: Any = threading.Thread,
+) -> bool:
+    if not capacity.try_acquire(listener_key):
+        try:
+            client.close()
+        except OSError:
+            pass
+        return False
+
+    def run_client() -> None:
+        try:
+            if registry is not None:
+                registry.add(client)
+            proxy_client(client, address, device)
+        finally:
+            if registry is not None:
+                registry.discard(client)
+            capacity.release(listener_key)
+
+    try:
+        thread_factory(target=run_client, daemon=True).start()
+    except Exception:
+        try:
+            client.close()
+        except OSError:
+            pass
+        capacity.release(listener_key)
+        return False
+    return True
+
+
+def start_proxy_server(host: str, port: int, device: str = "tun0", stop_event: threading.Event | None = None, registry: ConnRegistry | None = None, capacity: ProxyCapacity | None = None) -> None:
     is_ipv6 = ":" in host or host == ""
     af = socket.AF_INET6 if is_ipv6 else socket.AF_INET
     server = None
@@ -585,6 +660,8 @@ def start_proxy_server(host: str, port: int, device: str = "tun0", stop_event: t
     if stop_event is not None:
         server.settimeout(1.0)
 
+    capacity = capacity or proxy_capacity
+    listener_key = f"{host}:{port}"
     while True:
         if stop_event is not None and stop_event.is_set():
             try:
@@ -595,25 +672,13 @@ def start_proxy_server(host: str, port: int, device: str = "tun0", stop_event: t
             return
         try:
             client, address = server.accept()
-            if not proxy_connection_sem.acquire(blocking=False):
-                print(f"[代理限流] 当前连接数已达到上限 {MAX_PROXY_CONNECTIONS}，拒绝客户端 {address}", flush=True)
-                try:
-                    client.close()
-                except OSError:
-                    pass
-                continue
-
-            def run_client() -> None:
-                try:
-                    if registry is not None:
-                        registry.add(client)
-                    proxy_client(client, address, device)
-                finally:
-                    if registry is not None:
-                        registry.discard(client)
-                    proxy_connection_sem.release()
-
-            threading.Thread(target=run_client, daemon=True).start()
+            if not start_proxy_client_thread(
+                client, address, device, listener_key, capacity, registry
+            ):
+                print(
+                    f"[代理限流] {listener_key} 或全局连接数达到上限，拒绝客户端 {address}",
+                    flush=True,
+                )
         except socket.timeout:
             continue
         except Exception as e:
