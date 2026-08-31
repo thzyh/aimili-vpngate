@@ -1572,7 +1572,11 @@ def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bo
         if not startup_done[0]:
             lines.put(None)
 
-    threading.Thread(target=reader, daemon=True).start()
+    try:
+        threading.Thread(target=reader, daemon=True).start()
+    except Exception as exc:
+        stop_process(process)
+        return False, f"OpenVPN log reader thread failed: {exc}", None
     started = time.time()
     tail: list[str] = []
     ok = False
@@ -1627,7 +1631,7 @@ def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bo
     return ok, message, process
 
 
-def setup_policy_routing(interface: str = "tun0", table: int = 100) -> None:
+def setup_policy_routing(interface: str = "tun0", table: int = 100) -> bool:
     table_str = str(table)
     try:
         subprocess.run(["ip", "rule", "del", "table", table_str], capture_output=True, timeout=2)
@@ -1659,6 +1663,7 @@ def setup_policy_routing(interface: str = "tun0", table: int = 100) -> None:
     if not success:
         print(f"[路由配置失败] [错误代码 3003] [ERR_ROUTE_TABLE_ADD_FAILED] 策略路由配置失败。原因: 无法向路由表 {table_str} 添加默认路由，这可能会导致通过 VPN 接口的出站路由无法正常解析。请检查系统是否支持策略路由、iproute2 工具是否完整，以及是否具有 root 权限。", flush=True)
         log_to_json("ERROR", "Routing", f"[错误代码 3003] [ERR_ROUTE_TABLE_ADD_FAILED] 策略路由配置失败。原因: 无法向路由表 {table_str} 添加默认路由")
+    return success
 
 def cleanup_policy_routing(table: int = 100) -> None:
     table_str = str(table)
@@ -2498,7 +2503,12 @@ def connect_node(node_id: str) -> str:
             active_openvpn_node_id = node_id
         
         set_state(active_node_latency="配置路由", last_check_message="正在配置策略路由规则与流量转发...")
-        setup_policy_routing("tun0")
+        if not setup_policy_routing("tun0"):
+            stop_process(process)
+            with lock:
+                active_openvpn_process = None
+                active_openvpn_node_id = ""
+            raise RuntimeError("policy_routing_failed")
         
         global last_active_ping_time, last_active_latency
         last_active_ping_time = time.time()
@@ -2797,6 +2807,46 @@ def kill_slot_openvpn_processes() -> None:
             cleanup_policy_routing(SLOT_TABLE_BASE + i)
     except Exception as e:
         print(f"[多出口] 清理遗留槽位进程失败: {e}", flush=True)
+
+
+def kill_unregistered_slot_openvpn_processes(
+    slot: int, proc_root: Path = Path("/proc")
+) -> None:
+    """Reap only unregistered OpenVPN processes carrying this exact slot marker."""
+    if not sys.platform.startswith("linux") or not proc_root.exists():
+        return
+    with exit_slots_lock:
+        registered = exit_slots.get(slot, {}).get("process")
+        registered_pid = getattr(registered, "pid", None)
+    marker = ["--setenv", SLOT_PROCESS_MARKER, str(slot)]
+    killed: list[int] = []
+    for proc_dir in proc_root.iterdir():
+        if not proc_dir.name.isdigit():
+            continue
+        pid = int(proc_dir.name)
+        if pid in (os.getpid(), registered_pid):
+            continue
+        try:
+            raw = (proc_dir / "cmdline").read_bytes()
+        except OSError:
+            continue
+        args = [part.decode("utf-8", errors="replace") for part in raw.split(b"\0") if part]
+        if not args or "openvpn" not in Path(args[0]).name.lower():
+            continue
+        if not any(args[index:index + 3] == marker for index in range(len(args) - 2)):
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+            killed.append(pid)
+        except (ProcessLookupError, PermissionError):
+            pass
+    if killed:
+        time.sleep(0.5)
+        for pid in killed:
+            try:
+                os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
 
 def slot_device(i: int) -> str:
     return f"tun{SLOT_DEV_BASE + i}"
@@ -3207,6 +3257,7 @@ def bring_up_slot(i: int, node: dict[str, Any]) -> bool:
     ):
         return False
     dev = slot_device(i)
+    kill_unregistered_slot_openvpn_processes(i)
     cfg_path = slot_config_path(i)
     try:
         CONFIG_DIR.mkdir(exist_ok=True, parents=True)
@@ -3230,7 +3281,10 @@ def bring_up_slot(i: int, node: dict[str, Any]) -> bool:
             pass
         return False
 
-    setup_policy_routing(dev, slot_table(i))
+    if not setup_policy_routing(dev, slot_table(i)):
+        stop_process(process)
+        cleanup_policy_routing(slot_table(i))
+        return False
     ensure_slot_proxy(i)
     with exit_slots_lock:
         exit_slots[i] = {

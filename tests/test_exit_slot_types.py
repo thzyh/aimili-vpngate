@@ -1,6 +1,8 @@
 import threading
 import time
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import vpngate_manager as manager
@@ -149,6 +151,91 @@ class ExitSlotTypeTests(unittest.TestCase):
 
 
 class ManagedSlotFacadeTests(unittest.TestCase):
+    def test_slot_orphan_cleanup_matches_only_the_exact_managed_slot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            proc_root = Path(directory)
+            commands = {
+                101: ["/usr/sbin/openvpn", "--setenv", "AIMILI_SLOT", "2"],
+                102: ["/usr/sbin/openvpn", "--setenv", "AIMILI_SLOT", "1"],
+                103: ["/usr/sbin/openvpn", "--setenv", "NOT_AIMILI_SLOT", "2"],
+            }
+            for pid, command in commands.items():
+                path = proc_root / str(pid)
+                path.mkdir()
+                (path / "cmdline").write_bytes(b"\0".join(part.encode() for part in command) + b"\0")
+            killed = []
+            with (
+                mock.patch.object(manager.sys, "platform", "linux"),
+                mock.patch.object(manager.os, "kill", side_effect=lambda pid, sig: killed.append((pid, sig))),
+                mock.patch.object(manager.time, "sleep"),
+            ):
+                manager.kill_unregistered_slot_openvpn_processes(2, proc_root=proc_root)
+
+        self.assertEqual([pid for pid, _sig in killed], [101, 101])
+
+    def test_openvpn_reader_thread_failure_reaps_started_process(self):
+        class Process:
+            stdout = []
+
+            def __init__(self):
+                self.terminated = False
+                self.waited = False
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                self.terminated = True
+
+            def wait(self, timeout=None):
+                self.waited = True
+                return 0
+
+        class Thread:
+            def __init__(self, **_kwargs):
+                pass
+
+            def start(self):
+                raise RuntimeError("can't start new thread")
+
+        process = Process()
+        with (
+            mock.patch.object(manager.subprocess, "Popen", return_value=process),
+            mock.patch.object(manager.threading, "Thread", Thread),
+        ):
+            ok, message, returned = manager.run_openvpn_until_ready(
+                "slot.ovpn", True, True, timeout=1, dev="tun122"
+            )
+
+        self.assertFalse(ok)
+        self.assertIn("thread", message.lower())
+        self.assertIsNone(returned)
+        self.assertTrue(process.terminated)
+        self.assertTrue(process.waited)
+
+    def test_policy_routing_failure_reaps_process_and_does_not_register_slot(self):
+        process = mock.Mock()
+        node = {
+            "id": "jp-one", "country": "Japan", "country_short": "JP",
+            "ip": "198.51.100.10", "ip_type": "hosting", "config_text": "client",
+        }
+        runtime = {}
+        with (
+            mock.patch.object(manager, "CONFIG_DIR"),
+            mock.patch.object(manager, "slot_config_path", return_value=mock.MagicMock()),
+            mock.patch.object(manager, "run_openvpn_until_ready", return_value=(True, "ok", process)),
+            mock.patch.object(manager, "setup_policy_routing", return_value=False),
+            mock.patch.object(manager, "stop_process") as stop,
+            mock.patch.object(manager, "ensure_slot_proxy") as ensure_proxy,
+            mock.patch.object(manager, "exit_slots", runtime),
+        ):
+            result = manager.bring_up_slot(2, node)
+
+        self.assertFalse(result)
+        stop.assert_called_once_with(process)
+        ensure_proxy.assert_not_called()
+        self.assertNotIn(2, runtime)
+
     def test_create_managed_slot_pins_the_requested_candidate(self):
         candidates = [
             {"id": "jp-fast", "country_short": "JP", "country": "Japan", "ip_type": "hosting", "probe_status": "available", "latency_ms": 1},
