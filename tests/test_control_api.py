@@ -112,10 +112,14 @@ class FakeManager:
         return {
             "state": "completed",
             "country": "JP",
+            "resultCode": "success",
             "phase": "",
             "catalogCount": 20,
+            "officialCount": 8,
             "countryCandidateCount": 8,
             "testedCount": 5,
+            "usableCount": 4,
+            "retainedCount": 1,
             "validCount": 4,
             "preservedCount": 1,
             "startedAt": 1_700_000_000,
@@ -394,6 +398,10 @@ class ControlAPITests(unittest.TestCase):
         status, _, payload = self.request("GET", "/control/v1/candidates/refresh")
         self.assertEqual(status, 200)
         self.assertEqual(payload["data"]["testedCount"], 5)
+        self.assertEqual(payload["data"]["resultCode"], "success")
+        self.assertEqual(payload["data"]["officialCount"], 8)
+        self.assertEqual(payload["data"]["usableCount"], 4)
+        self.assertEqual(payload["data"]["retainedCount"], 1)
         serialized = json.dumps(payload).lower()
         for forbidden in ["password", "token", "config", "exception"]:
             self.assertNotIn(forbidden, serialized)
@@ -481,6 +489,32 @@ class ControlAPITests(unittest.TestCase):
         )
         self.assertEqual(status, 400)
         self.assertEqual(payload, {"error": {"code": "invalid_request"}})
+
+    def test_candidate_rejection_error_exposes_only_closed_safe_fields(self):
+        self.manager.assign_managed_slot = lambda *_args: {
+            "ok": False,
+            "error_code": "candidate_dial_failed",
+            "candidate_rejected": True,
+            "exception": "must not escape",
+        }
+
+        status, _, payload = self.request(
+            "POST",
+            "/control/v1/slots/2/assign",
+            {"candidateId": "node-safe", "country": "JP", "proxyType": "datacenter"},
+        )
+
+        self.assertEqual(status, 409)
+        self.assertEqual(
+            payload,
+            {
+                "error": {
+                    "code": "candidate_dial_failed",
+                    "candidateRejected": True,
+                }
+            },
+        )
+        self.assertNotIn("exception", json.dumps(payload).lower())
 
     def test_start_control_server_reads_nonempty_token_file(self):
         with tempfile.TemporaryDirectory() as temporary:

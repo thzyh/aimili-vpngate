@@ -875,6 +875,134 @@ class ManagerMainAssignmentTests(unittest.TestCase):
         self.assertEqual(status["candidate_id"], "new-main")
         self.assertNotIn("config_text", status)
 
+    def test_main_stage_reports_and_persists_proven_dial_failure(self):
+        settings = {
+            "connection_enabled": True,
+            "routing_mode": "fixed_ip",
+            "routing_ip_type": "all",
+            "fixed_node_id": "old-main",
+        }
+        with (
+            mock.patch.object(manager, "read_nodes", return_value=self.nodes),
+            mock.patch.object(manager, "load_ui_config", return_value=settings),
+            mock.patch.object(manager, "current_slot_node_ids", return_value=set()),
+            mock.patch.object(
+                manager,
+                "connect_node",
+                side_effect=manager.CandidateUnavailableError("candidate_dial_failed"),
+            ),
+            mock.patch.object(
+                manager,
+                "_restore_main_candidate",
+                return_value={"dns_verified": True, "exit_verified": True, "available": True},
+            ),
+            mock.patch.object(manager, "mark_candidate_unavailable", return_value=True) as mark,
+        ):
+            result = manager.stage_main_assignment(
+                "new-main", "JP", "datacenter", "old-main", "gateway-dial-failure"
+            )
+
+        mark.assert_called_once_with("new-main", "candidate_dial_failed")
+        self.assertEqual(result["error_code"], "candidate_dial_failed")
+        self.assertTrue(result["candidate_rejected"])
+
+    def test_main_stage_reports_and_persists_proven_egress_failure(self):
+        settings = {
+            "connection_enabled": True,
+            "routing_mode": "fixed_ip",
+            "routing_ip_type": "all",
+            "fixed_node_id": "old-main",
+        }
+        with (
+            mock.patch.object(manager, "read_nodes", return_value=self.nodes),
+            mock.patch.object(manager, "load_ui_config", return_value=settings),
+            mock.patch.object(manager, "current_slot_node_ids", return_value=set()),
+            mock.patch.object(manager, "connect_node"),
+            mock.patch.object(manager, "active_openvpn_running", return_value=True),
+            mock.patch.object(manager, "check_proxy_health", return_value={"ok": False}),
+            mock.patch.object(manager, "check_interface_exit_ip", return_value=(False, "")),
+            mock.patch.object(
+                manager,
+                "_restore_main_candidate",
+                return_value={"dns_verified": True, "exit_verified": True, "available": True},
+            ),
+            mock.patch.object(manager, "mark_candidate_unavailable", return_value=True) as mark,
+        ):
+            result = manager.stage_main_assignment(
+                "new-main", "JP", "datacenter", "old-main", "gateway-egress-failure"
+            )
+
+        mark.assert_called_once_with("new-main", "candidate_egress_failed")
+        self.assertEqual(result["error_code"], "candidate_egress_failed")
+        self.assertTrue(result["candidate_rejected"])
+
+    def test_main_stage_keeps_candidate_when_tunnel_egress_is_healthy(self):
+        settings = {
+            "connection_enabled": True,
+            "routing_mode": "fixed_ip",
+            "routing_ip_type": "all",
+            "fixed_node_id": "old-main",
+        }
+        with (
+            mock.patch.object(manager, "read_nodes", return_value=self.nodes),
+            mock.patch.object(manager, "load_ui_config", return_value=settings),
+            mock.patch.object(manager, "current_slot_node_ids", return_value=set()),
+            mock.patch.object(manager, "connect_node"),
+            mock.patch.object(manager, "active_openvpn_running", return_value=True),
+            mock.patch.object(manager, "check_proxy_health", return_value={"ok": False}),
+            mock.patch.object(
+                manager,
+                "check_interface_exit_ip",
+                return_value=(True, "203.0.113.70"),
+            ),
+            mock.patch.object(
+                manager,
+                "_restore_main_candidate",
+                return_value={"dns_verified": True, "exit_verified": True, "available": True},
+            ),
+            mock.patch.object(manager, "mark_candidate_unavailable") as mark,
+        ):
+            result = manager.stage_main_assignment(
+                "new-main", "JP", "datacenter", "old-main", "gateway-proxy-failure"
+            )
+
+        self.assertEqual(result["error_code"], "assign_failed_rolled_back")
+        self.assertNotIn("candidate_rejected", result)
+        mark.assert_not_called()
+
+    def test_gateway_validation_rollback_does_not_reject_candidate(self):
+        with (
+            mock.patch.object(manager, "mark_candidate_unavailable") as mark,
+            mock.patch.object(
+                manager,
+                "_restore_main_candidate",
+                return_value={"dns_verified": True, "exit_verified": True, "available": True},
+            ),
+        ):
+            manager.main_assignment_coordinator.stage(
+                candidate_id="new-main",
+                country="JP",
+                proxy_type="datacenter",
+                expected_current_candidate_id="old-main",
+                idempotency_key="gateway-external-validation",
+                current=current_snapshot(),
+                slot_candidate_ids=set(),
+                stage_candidate=lambda _candidate: {
+                    "dns_verified": True,
+                    "exit_verified": True,
+                    "available": True,
+                },
+                restore_previous=lambda _previous: {
+                    "dns_verified": True,
+                    "exit_verified": True,
+                    "available": True,
+                },
+            )
+            result = manager.rollback_main_assignment("manager-op-1")
+
+        self.assertEqual(result["state"], "rolled_back")
+        mark.assert_not_called()
+
     def test_safe_main_status_normalizes_real_node_ip_type(self):
         with (
             mock.patch.object(manager, "read_nodes", return_value=self.nodes),

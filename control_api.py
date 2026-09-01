@@ -140,7 +140,10 @@ class ControlHandler(BaseHTTPRequestHandler):
                 status = HTTPStatus.SERVICE_UNAVAILABLE
             else:
                 status = HTTPStatus.CONFLICT
-            self._error(status, code)
+            error = {"code": code}
+            if isinstance(result.get("candidate_rejected"), bool):
+                error["candidateRejected"] = result["candidate_rejected"]
+            self._send_json(status, {"error": error})
             return
         if isinstance(result, dict):
             result = dict(result)

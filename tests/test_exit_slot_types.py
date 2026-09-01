@@ -1,3 +1,4 @@
+import json
 import threading
 import time
 import tempfile
@@ -9,6 +10,211 @@ import vpngate_manager as manager
 
 
 class ExitSlotTypeTests(unittest.TestCase):
+    def test_mark_candidate_unavailable_persists_blacklist_and_pool_state(self):
+        candidate = {
+            "id": "jp-stale",
+            "country_short": "JP",
+            "country": "Japan",
+            "ip": "198.51.100.30",
+            "exit_ip": "203.0.113.30",
+            "exit_ip_checked_at": 90.0,
+            "ip_type": "hosting",
+            "probe_status": "available",
+            "config_text": "client",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            nodes_file = Path(directory) / "nodes.json"
+            blacklist_file = Path(directory) / "blacklist.json"
+            nodes_file.write_text(json.dumps([candidate]), encoding="utf-8")
+            blacklist_file.write_text("{}", encoding="utf-8")
+            with (
+                mock.patch.object(manager, "NODES_FILE", nodes_file),
+                mock.patch.object(manager, "BLACKLIST_FILE", blacklist_file),
+                mock.patch.object(manager, "active_openvpn_node_id", ""),
+                mock.patch.object(manager, "reserved_slot_candidate_ids", return_value=set()),
+            ):
+                checked_at = time.time()
+                changed = manager.mark_candidate_unavailable(
+                    "jp-stale", "candidate_dial_failed", now=checked_at
+                )
+                reloaded = json.loads(nodes_file.read_text(encoding="utf-8"))
+                candidates_after_restart = manager.safe_candidate_snapshot()
+
+            blacklist = json.loads(blacklist_file.read_text(encoding="utf-8"))
+
+        self.assertTrue(changed)
+        self.assertEqual(reloaded[0]["probe_status"], "unavailable")
+        self.assertEqual(reloaded[0]["probe_message"], "candidate_dial_failed")
+        self.assertNotIn("exit_ip", reloaded[0])
+        self.assertEqual(blacklist["jp-stale"]["reason_code"], "candidate_dial_failed")
+        self.assertEqual(candidates_after_restart, [])
+
+    def test_mark_candidate_unavailable_rejects_non_candidate_failures(self):
+        with (
+            mock.patch.object(manager, "read_nodes") as read,
+            mock.patch.object(manager, "write_json") as write,
+        ):
+            changed = manager.mark_candidate_unavailable(
+                "jp-one", "gateway_validation_failed", now=100.0
+            )
+
+        self.assertFalse(changed)
+        read.assert_not_called()
+        write.assert_not_called()
+
+    def test_blacklist_remains_authoritative_when_nodes_write_crashes(self):
+        candidate = {
+            "id": "jp-crash",
+            "country_short": "JP",
+            "country": "Japan",
+            "ip": "198.51.100.31",
+            "ip_type": "hosting",
+            "probe_status": "available",
+            "config_file": "jp-crash.ovpn",
+            "config_text": "client",
+        }
+        original_write_json = manager.write_json
+        with tempfile.TemporaryDirectory() as directory:
+            nodes_file = Path(directory) / "nodes.json"
+            blacklist_file = Path(directory) / "blacklist.json"
+            nodes_file.write_text(json.dumps([candidate]), encoding="utf-8")
+            blacklist_file.write_text("{}", encoding="utf-8")
+
+            def crash_after_blacklist(path, payload):
+                if path == nodes_file:
+                    raise OSError("simulated nodes write crash")
+                return original_write_json(path, payload)
+
+            with (
+                mock.patch.object(manager, "NODES_FILE", nodes_file),
+                mock.patch.object(manager, "BLACKLIST_FILE", blacklist_file),
+                mock.patch.object(manager, "active_openvpn_node_id", ""),
+                mock.patch.object(manager, "reserved_slot_candidate_ids", return_value=set()),
+                mock.patch.object(manager, "write_json", side_effect=crash_after_blacklist),
+            ):
+                with self.assertRaises(OSError):
+                    manager.mark_candidate_unavailable(
+                        "jp-crash", "candidate_dial_failed", now=time.time()
+                    )
+
+            self.assertEqual(
+                json.loads(nodes_file.read_text(encoding="utf-8"))[0]["probe_status"],
+                "available",
+            )
+            with (
+                mock.patch.object(manager, "NODES_FILE", nodes_file),
+                mock.patch.object(manager, "BLACKLIST_FILE", blacklist_file),
+                mock.patch.object(manager, "active_openvpn_node_id", ""),
+                mock.patch.object(manager, "reserved_slot_candidate_ids", return_value=set()),
+                mock.patch.object(manager, "main_reserved_candidate_ids", return_value=set()),
+                mock.patch.object(manager, "get_slot_pin_map", return_value={}),
+                mock.patch.object(manager, "get_exit_slot_config", return_value={"active": [2], "country": "JP", "residential_only": False}),
+                mock.patch.object(manager, "get_active_slots", return_value=[2]),
+                mock.patch.object(manager, "per_slot_country", return_value="JP"),
+                mock.patch.object(manager, "per_slot_isp", return_value=""),
+                mock.patch.object(manager, "per_slot_type", return_value="datacenter"),
+            ):
+                self.assertEqual(manager.safe_candidate_snapshot(), [])
+                self.assertEqual(
+                    manager.select_slot_nodes(set(), 1, "JP", False, proxy_type="datacenter"),
+                    [],
+                )
+                self.assertIsNone(manager.pick_slot_node(2, set()))
+                self.assertEqual(
+                    manager.assign_node_to_slot(2, "jp-crash")["error"],
+                    "未找到该节点",
+                )
+                self.assertEqual(
+                    manager.add_slot_with_node("jp-crash")["error"],
+                    "未找到该节点",
+                )
+                self.assertEqual(
+                    manager.assign_managed_slot(2, "jp-crash", "JP", "datacenter")["error_code"],
+                    "candidate_not_found",
+                )
+
+    def test_connect_node_does_not_reject_candidate_for_local_openvpn_failure(self):
+        candidate = {
+            "id": "jp-local-failure",
+            "country_short": "JP",
+            "country": "Japan",
+            "ip": "198.51.100.32",
+            "ip_type": "hosting",
+            "probe_status": "available",
+            "config_text": "client",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory) / "data"
+            config_dir = Path(directory) / "configs"
+            config_file = config_dir / "candidate.ovpn"
+            candidate["config_file"] = str(config_file)
+            for failure in (
+                "OpenVPN log reader thread failed",
+                "permission denied while opening TUN device",
+                "cannot ioctl TUNSETIFF",
+                "OpenVPN timeout after 12s",
+            ):
+                with self.subTest(failure=failure):
+                    with (
+                        mock.patch.object(manager, "DATA_DIR", data_dir),
+                        mock.patch.object(manager, "CONFIG_DIR", config_dir),
+                        mock.patch.object(manager, "is_connecting", False),
+                        mock.patch.object(manager, "active_openvpn_node_id", ""),
+                        mock.patch.object(manager, "read_nodes", return_value=[candidate]),
+                        mock.patch.object(manager, "reserved_slot_candidate_ids", return_value=set()),
+                        mock.patch.object(manager, "load_ui_config", return_value={}),
+                        mock.patch.object(manager, "set_state"),
+                        mock.patch.object(manager, "log_to_json"),
+                        mock.patch.object(manager, "stop_active_openvpn"),
+                        mock.patch.object(
+                            manager,
+                            "run_openvpn_until_ready",
+                            return_value=(False, failure, None),
+                        ),
+                        mock.patch.object(manager, "mark_candidate_unavailable") as mark,
+                    ):
+                        with self.assertRaises(RuntimeError):
+                            manager.connect_node("jp-local-failure")
+
+                    mark.assert_not_called()
+
+    def test_connect_node_rejects_candidate_for_explicit_remote_refusal(self):
+        candidate = {
+            "id": "jp-refused",
+            "country_short": "JP",
+            "country": "Japan",
+            "ip": "198.51.100.33",
+            "ip_type": "hosting",
+            "probe_status": "available",
+            "config_text": "client",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory) / "data"
+            config_dir = Path(directory) / "configs"
+            candidate["config_file"] = str(config_dir / "candidate.ovpn")
+            with (
+                mock.patch.object(manager, "DATA_DIR", data_dir),
+                mock.patch.object(manager, "CONFIG_DIR", config_dir),
+                mock.patch.object(manager, "is_connecting", False),
+                mock.patch.object(manager, "active_openvpn_node_id", ""),
+                mock.patch.object(manager, "read_nodes", return_value=[candidate]),
+                mock.patch.object(manager, "reserved_slot_candidate_ids", return_value=set()),
+                mock.patch.object(manager, "load_ui_config", return_value={}),
+                mock.patch.object(manager, "set_state"),
+                mock.patch.object(manager, "log_to_json"),
+                mock.patch.object(manager, "stop_active_openvpn"),
+                mock.patch.object(
+                    manager,
+                    "run_openvpn_until_ready",
+                    return_value=(False, "TCP connection refused", None),
+                ),
+                mock.patch.object(manager, "mark_candidate_unavailable", return_value=True) as mark,
+            ):
+                with self.assertRaises(manager.CandidateUnavailableError):
+                    manager.connect_node("jp-refused")
+
+        mark.assert_called_once_with("jp-refused", "candidate_dial_failed")
+
     def test_normalize_proxy_type_maps_only_supported_categories(self):
         cases = {
             "residential": "residential",
@@ -155,6 +361,135 @@ class ExitSlotTypeTests(unittest.TestCase):
 
 
 class ManagedSlotFacadeTests(unittest.TestCase):
+    def test_check_managed_slot_persists_proven_egress_failure(self):
+        snapshot = {
+            "ok": True,
+            "slot": 2,
+            "node_id": "jp-stale",
+            "port": 17930,
+            "status": "up",
+        }
+        runtime = {2: {"node_id": "jp-stale", "status": "up"}}
+        with (
+            mock.patch.object(manager, "managed_slot_snapshot", return_value=snapshot),
+            mock.patch.object(manager, "check_slot_egress", return_value=(False, "")),
+            mock.patch.object(manager, "check_interface_exit_ip", return_value=(False, "")),
+            mock.patch.object(manager, "slot_process_alive", return_value=True),
+            mock.patch.object(manager, "mark_candidate_unavailable", return_value=True) as mark,
+            mock.patch.object(manager, "exit_slots", runtime),
+            mock.patch.object(manager, "write_slots_state"),
+        ):
+            result = manager.check_managed_slot(2)
+
+        mark.assert_called_once_with("jp-stale", "candidate_egress_failed")
+        self.assertEqual(result["error_code"], "candidate_egress_failed")
+        self.assertTrue(result["candidate_rejected"])
+
+    def test_check_managed_slot_keeps_candidate_when_tunnel_egress_is_healthy(self):
+        snapshot = {
+            "ok": True,
+            "slot": 2,
+            "node_id": "jp-live",
+            "port": 17930,
+            "status": "up",
+        }
+        with (
+            mock.patch.object(manager, "managed_slot_snapshot", return_value=snapshot),
+            mock.patch.object(manager, "check_slot_egress", return_value=(False, "")),
+            mock.patch.object(
+                manager,
+                "check_interface_exit_ip",
+                return_value=(True, "203.0.113.40"),
+            ),
+            mock.patch.object(manager, "slot_process_alive", return_value=True),
+            mock.patch.object(manager, "mark_candidate_unavailable") as mark,
+            mock.patch.object(manager, "exit_slots", {2: {"node_id": "jp-live"}}),
+            mock.patch.object(manager, "write_slots_state"),
+        ):
+            result = manager.check_managed_slot(2)
+
+        self.assertEqual(result["error_code"], "egress_check_failed")
+        self.assertFalse(result["candidate_rejected"])
+        mark.assert_not_called()
+
+    def test_assign_managed_slot_propagates_proven_candidate_failure(self):
+        candidate = {
+            "id": "jp-stale",
+            "country_short": "JP",
+            "country": "Japan",
+            "ip_type": "hosting",
+            "probe_status": "available",
+        }
+        previous = {"node_id": "", "status": "pending"}
+        with (
+            mock.patch.object(manager, "get_active_slots", return_value=[2]),
+            mock.patch.object(manager, "read_nodes", return_value=[candidate]),
+            mock.patch.object(manager, "reserved_slot_candidate_ids", return_value=set()),
+            mock.patch.object(manager, "exit_slots", {2: previous}),
+            mock.patch.object(manager, "get_slot_pin_map", return_value={}),
+            mock.patch.object(manager, "get_slot_country_map", return_value={}),
+            mock.patch.object(manager, "get_slot_type_map", return_value={}),
+            mock.patch.object(manager, "set_slot_country"),
+            mock.patch.object(manager, "set_slot_type"),
+            mock.patch.object(
+                manager,
+                "assign_node_to_slot",
+                return_value={
+                    "ok": False,
+                    "error_code": "candidate_dial_failed",
+                    "candidate_rejected": True,
+                },
+            ),
+        ):
+            result = manager.assign_managed_slot(2, "jp-stale", "JP", "datacenter")
+
+        self.assertEqual(result["error_code"], "candidate_dial_failed")
+        self.assertTrue(result["candidate_rejected"])
+
+    def test_assign_managed_slot_preserves_rejection_when_restore_fails(self):
+        candidate = {
+            "id": "jp-stale",
+            "country_short": "JP",
+            "country": "Japan",
+            "ip_type": "hosting",
+            "probe_status": "available",
+        }
+        previous = {"node_id": "jp-old", "status": "up"}
+        with (
+            mock.patch.object(manager, "get_active_slots", return_value=[2]),
+            mock.patch.object(manager, "read_nodes", return_value=[candidate]),
+            mock.patch.object(manager, "reserved_slot_candidate_ids", return_value=set()),
+            mock.patch.object(manager, "exit_slots", {2: previous}),
+            mock.patch.object(manager, "get_slot_pin_map", return_value={"2": "jp-old"}),
+            mock.patch.object(manager, "get_slot_country_map", return_value={"2": "US"}),
+            mock.patch.object(manager, "get_slot_type_map", return_value={"2": "datacenter"}),
+            mock.patch.object(manager, "set_slot_country"),
+            mock.patch.object(manager, "set_slot_type"),
+            mock.patch.object(
+                manager,
+                "assign_node_to_slot",
+                side_effect=[
+                    {
+                        "ok": False,
+                        "error_code": "candidate_dial_failed",
+                        "candidate_rejected": True,
+                    },
+                    {"ok": False, "error_code": "assign_failed"},
+                ],
+            ),
+        ):
+            result = manager.assign_managed_slot(2, "jp-stale", "JP", "datacenter")
+
+        self.assertEqual(
+            result,
+            {
+                "ok": False,
+                "state": "repair_required",
+                "error_code": "rollback_failed",
+                "candidate_rejected": True,
+            },
+        )
+
     def test_slot_orphan_cleanup_matches_only_the_exact_managed_slot(self):
         with tempfile.TemporaryDirectory() as directory:
             proc_root = Path(directory)

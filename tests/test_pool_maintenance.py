@@ -75,6 +75,10 @@ class PoolMaintenanceTests(unittest.TestCase):
         self.assertEqual(snapshot["state"], "completed")
         self.assertEqual(snapshot["country"], "JP")
         self.assertEqual(snapshot["catalogCount"], 3)
+        self.assertEqual(snapshot["resultCode"], "success")
+        self.assertEqual(snapshot["officialCount"], 1)
+        self.assertEqual(snapshot["usableCount"], 1)
+        self.assertEqual(snapshot["retainedCount"], 0)
         self.assertEqual(snapshot["countryCandidateCount"], 1)
         self.assertEqual(snapshot["testedCount"], 1)
         self.assertNotIn("exception", snapshot)
@@ -106,6 +110,7 @@ class PoolMaintenanceTests(unittest.TestCase):
         with (
             mock.patch.object(manager, "read_nodes", return_value=existing),
             mock.patch.object(manager, "fetch_candidates", return_value=candidates),
+            mock.patch.object(manager, "country_catalog_snapshot", return_value=[{"code": "JP", "candidateCount": 8}]),
             mock.patch.object(manager, "current_slot_node_ids", return_value={"jp-slot"}),
             mock.patch.object(manager, "probe_nodes", side_effect=probe),
             mock.patch.object(manager, "load_blacklist", return_value={}),
@@ -115,6 +120,7 @@ class PoolMaintenanceTests(unittest.TestCase):
             result = manager.refresh_country_nodes("JP", target_size=5, max_probes=20)
 
         self.assertEqual(result["state"], "completed")
+        self.assertEqual(result["resultCode"], "success")
         self.assertEqual(result["testedCount"], 4)
         self.assertEqual(result["validCount"], 6)
         self.assertEqual(
@@ -136,6 +142,7 @@ class PoolMaintenanceTests(unittest.TestCase):
         with (
             mock.patch.object(manager, "read_nodes", return_value=[]),
             mock.patch.object(manager, "fetch_candidates", return_value=candidates),
+            mock.patch.object(manager, "country_catalog_snapshot", return_value=[{"code": "JP", "candidateCount": 30}]),
             mock.patch.object(manager, "current_slot_node_ids", return_value=set()),
             mock.patch.object(manager, "probe_nodes", side_effect=fail),
             mock.patch.object(manager, "load_blacklist", return_value={}),
@@ -145,9 +152,155 @@ class PoolMaintenanceTests(unittest.TestCase):
             result = manager.refresh_country_nodes("JP", target_size=5, max_probes=20)
 
         self.assertEqual(result["state"], "completed")
+        self.assertEqual(result["resultCode"], "no_usable_nodes")
         self.assertEqual(result["testedCount"], 20)
         self.assertEqual(result["validCount"], 0)
         self.assertEqual(result["stopReason"], "probe_limit_reached")
+
+    def test_country_refresh_distinguishes_empty_official_catalog(self):
+        with (
+            mock.patch.object(manager, "read_nodes", return_value=[]),
+            mock.patch.object(manager, "fetch_candidates", return_value=[]),
+            mock.patch.object(
+                manager,
+                "country_catalog_snapshot",
+                return_value=[{"code": "US", "candidateCount": 4}],
+            ),
+            mock.patch.object(manager, "current_slot_node_ids", return_value=set()),
+            mock.patch.object(manager, "load_blacklist", return_value={}),
+            mock.patch.object(manager, "write_json"),
+            mock.patch.object(manager, "set_state"),
+        ):
+            result = manager.refresh_country_nodes("JP")
+
+        self.assertEqual(result["state"], "completed")
+        self.assertEqual(result["resultCode"], "no_official_candidates")
+        self.assertEqual(result["officialCount"], 0)
+        self.assertEqual(result["testedCount"], 0)
+        self.assertEqual(result["usableCount"], 0)
+
+    def test_country_refresh_maps_upstream_exception_without_exposing_it(self):
+        with (
+            mock.patch.object(manager, "read_nodes", return_value=[country_node("us-one", "US", "available")]),
+            mock.patch.object(
+                manager,
+                "fetch_candidates",
+                side_effect=RuntimeError("upstream detail must stay private"),
+            ),
+            mock.patch.object(manager, "write_json") as write,
+            mock.patch.object(manager, "set_state"),
+        ):
+            result = manager.refresh_country_nodes("JP")
+
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["resultCode"], "upstream_unavailable")
+        self.assertEqual(result["errorCode"], "upstream_unavailable")
+        self.assertNotIn("detail", str(result).lower())
+        write.assert_not_called()
+
+    def test_country_refresh_busy_results_use_closed_result_codes(self):
+        with mock.patch.object(manager, "main_mutation_allowed", return_value=False):
+            operation_busy = manager.refresh_country_nodes("JP")
+        self.assertEqual(operation_busy["resultCode"], "operation_busy")
+
+        manager.maintenance_lock.acquire()
+        try:
+            maintenance_busy = manager.refresh_country_nodes("JP")
+        finally:
+            manager.maintenance_lock.release()
+        self.assertEqual(maintenance_busy["resultCode"], "maintenance_busy")
+
+    def test_country_refresh_worker_releases_preacquired_maintenance_lock_when_mutation_is_busy(self):
+        captured = {}
+        original_state = manager.country_refresh_snapshot()
+
+        class DeferredThread:
+            def __init__(self, *, target, args, **_kwargs):
+                captured["target"] = target
+                captured["args"] = args
+
+            def start(self):
+                return None
+
+        manager._set_country_refresh(state="idle", country="", phase="")
+        try:
+            with mock.patch.object(manager.threading, "Thread", DeferredThread):
+                accepted = manager.start_country_refresh("JP")
+            self.assertEqual(accepted["state"], "running")
+            self.assertTrue(manager.maintenance_lock.locked())
+
+            lease = manager.acquire_mutation_lease("worker-conflict")
+            self.assertTrue(lease["ok"])
+            try:
+                captured["target"](*captured["args"])
+            finally:
+                manager.release_mutation_lease(lease["lease_id"])
+
+            self.assertFalse(manager.maintenance_lock.locked())
+            self.assertEqual(
+                manager.country_refresh_snapshot()["resultCode"],
+                "operation_busy",
+            )
+        finally:
+            manager._set_country_refresh(**original_state)
+            if manager.maintenance_lock.locked():
+                manager.maintenance_lock.release()
+
+    def test_country_refresh_worker_preserves_upstream_failure_code(self):
+        original_state = manager.country_refresh_snapshot()
+        try:
+            manager._set_country_refresh(state="running", country="JP", phase="fetching")
+            gate = manager.threading.Event()
+            gate.set()
+            with mock.patch.object(
+                manager,
+                "refresh_country_nodes",
+                return_value={
+                    "state": "failed",
+                    "country": "JP",
+                    "resultCode": "upstream_unavailable",
+                    "errorCode": "upstream_unavailable",
+                },
+            ):
+                manager._country_refresh_worker("JP", gate)
+
+            snapshot = manager.country_refresh_snapshot()
+            self.assertEqual(snapshot["state"], "failed")
+            self.assertEqual(snapshot["resultCode"], "upstream_unavailable")
+            self.assertEqual(snapshot["errorCode"], "upstream_unavailable")
+        finally:
+            manager._set_country_refresh(**original_state)
+
+    def test_country_refresh_new_round_clears_previous_result_code(self):
+        captured = {}
+        original_state = manager.country_refresh_snapshot()
+
+        class DeferredThread:
+            def __init__(self, *, target, args, **_kwargs):
+                captured["target"] = target
+                captured["args"] = args
+
+            def start(self):
+                return None
+
+        manager._set_country_refresh(
+            state="completed",
+            country="US",
+            phase="",
+            resultCode="no_usable_nodes",
+            errorCode="",
+        )
+        try:
+            with mock.patch.object(manager.threading, "Thread", DeferredThread):
+                accepted = manager.start_country_refresh("JP")
+
+            self.assertEqual(accepted["state"], "running")
+            self.assertEqual(accepted["country"], "JP")
+            self.assertNotIn("resultCode", accepted)
+        finally:
+            manager._set_country_refresh(**original_state)
+            if manager.maintenance_lock.locked():
+                manager.maintenance_lock.release()
 
     def test_collector_delays_boot_scan_and_backs_off_after_failure(self):
         sleeps = []

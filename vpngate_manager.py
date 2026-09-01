@@ -161,6 +161,37 @@ LOCAL_PROXY_PORT = env_int("LOCAL_PROXY_PORT", 7928, 1, 65535)
 UI_HOST = os.environ.get("UI_HOST", "::")
 UI_PORT = env_int("UI_PORT", 8787, 1, 65535)
 INVALID_BACKOFF_SECONDS = env_int("INVALID_BACKOFF_SECONDS", 30 * 60, 1)
+CANDIDATE_FAILURE_CODES = frozenset(
+    {"candidate_dial_failed", "candidate_egress_failed"}
+)
+
+
+class CandidateUnavailableError(RuntimeError):
+    """只表示已经由 AimiliVPN 证明的候选自身故障。"""
+
+    def __init__(self, reason_code: str, *, persisted: bool = False):
+        if reason_code not in CANDIDATE_FAILURE_CODES:
+            raise ValueError("invalid candidate failure code")
+        super().__init__(reason_code)
+        self.reason_code = reason_code
+        self.persisted = persisted
+
+
+def _candidate_failure_response(
+    reason_code: str,
+    fallback_code: str,
+) -> dict[str, Any]:
+    if reason_code in CANDIDATE_FAILURE_CODES:
+        return {
+            "ok": False,
+            "error_code": reason_code,
+            "candidate_rejected": True,
+        }
+    return {
+        "ok": False,
+        "error_code": fallback_code,
+        "candidate_rejected": False,
+    }
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ["VPNGATE_DATA_DIR"]).resolve() if os.environ.get("VPNGATE_DATA_DIR") else ROOT_DIR / "vpngate_data"
@@ -184,8 +215,11 @@ country_refresh_state: dict[str, Any] = {
     "country": "",
     "phase": "",
     "catalogCount": 0,
+    "officialCount": 0,
     "countryCandidateCount": 0,
     "testedCount": 0,
+    "usableCount": 0,
+    "retainedCount": 0,
     "validCount": 0,
     "preservedCount": 0,
     "startedAt": 0.0,
@@ -517,7 +551,13 @@ def read_nodes() -> list[dict[str, Any]]:
     raw = read_json(NODES_FILE, [])
     if not isinstance(raw, list):
         return []
-    return [item for item in raw if isinstance(item, dict)]
+    blacklisted_ids = set(load_blacklist())
+    return [
+        item
+        for item in raw
+        if isinstance(item, dict)
+        and str(item.get("id") or "").strip() not in blacklisted_ids
+    ]
 
 def get_state() -> dict[str, Any]:
     global active_openvpn_node_id, is_connecting
@@ -680,8 +720,28 @@ def _main_validation() -> dict[str, bool]:
 def _stage_main_candidate(candidate_id: str) -> dict[str, bool]:
     main_assignment_thread.authorized = True
     try:
-        connect_node(candidate_id)
-        return _main_validation()
+        try:
+            connect_node(candidate_id)
+        except CandidateUnavailableError as exc:
+            if not exc.persisted:
+                mark_candidate_unavailable(candidate_id, exc.reason_code)
+            main_assignment_thread.candidate_failure_code = exc.reason_code
+            raise
+        validation = _main_validation()
+        if not all(validation.values()):
+            tunnel_running = active_openvpn_running()
+            tunnel_egress_ok = False
+            if tunnel_running:
+                tunnel_egress_ok, _exit_ip = check_interface_exit_ip("tun0")
+            if not tunnel_egress_ok:
+                reason_code = (
+                    "candidate_egress_failed"
+                    if tunnel_running
+                    else "candidate_dial_failed"
+                )
+                mark_candidate_unavailable(candidate_id, reason_code)
+                main_assignment_thread.candidate_failure_code = reason_code
+        return validation
     finally:
         main_assignment_thread.authorized = False
 
@@ -745,7 +805,8 @@ def _stage_main_assignment_unlocked(
         or normalize_proxy_type(candidate.get("ip_type")) != proxy_type
     ):
         return {"ok": False, "error_code": "candidate_mismatch"}
-    return main_assignment_coordinator.stage(
+    main_assignment_thread.candidate_failure_code = ""
+    result = main_assignment_coordinator.stage(
         candidate_id=candidate_id,
         country=country,
         proxy_type=proxy_type,
@@ -756,6 +817,15 @@ def _stage_main_assignment_unlocked(
         stage_candidate=_stage_main_candidate,
         restore_previous=_restore_main_candidate,
     )
+    failure_code = str(
+        getattr(main_assignment_thread, "candidate_failure_code", "") or ""
+    )
+    main_assignment_thread.candidate_failure_code = ""
+    if result.get("ok") is False and failure_code in CANDIDATE_FAILURE_CODES:
+        result = dict(result)
+        result["error_code"] = failure_code
+        result["candidate_rejected"] = True
+    return result
 
 
 def stage_main_assignment(
@@ -1319,6 +1389,63 @@ def mark_blacklisted(node: dict[str, Any], message: str) -> None:
     }
     write_json(BLACKLIST_FILE, blacklist)
 
+
+def mark_candidate_unavailable(
+    candidate_id: str,
+    reason_code: str,
+    now: float | None = None,
+) -> bool:
+    """持久淘汰已由本服务证明拨号或出口失败的候选。"""
+    candidate_id = str(candidate_id or "").strip()
+    reason_code = str(reason_code or "").strip()
+    if not candidate_id or reason_code not in CANDIDATE_FAILURE_CODES:
+        return False
+    checked_at = time.time() if now is None else float(now)
+    with lock:
+        nodes = read_nodes()
+        failed: dict[str, Any] | None = None
+        updated: list[dict[str, Any]] = []
+        for item in nodes:
+            current = dict(item)
+            if str(current.get("id") or "").strip() == candidate_id:
+                current["probe_status"] = "unavailable"
+                current["probe_message"] = reason_code
+                current["last_probe_at"] = checked_at
+                current["probed_at"] = checked_at
+                current.pop("exit_ip", None)
+                current.pop("exit_ip_checked_at", None)
+                failed = current
+            updated.append(current)
+        if failed is None:
+            return False
+
+        blacklist = load_blacklist()
+        blacklist[candidate_id] = {
+            "id": candidate_id,
+            "ip": failed.get("ip") or failed.get("remote_host") or "",
+            "country": failed.get("country") or "",
+            "reason": reason_code,
+            "reason_code": reason_code,
+            "marked_at": checked_at,
+            "until": checked_at + INVALID_BACKOFF_SECONDS,
+        }
+        protected_ids = node_pool.protected_node_ids(
+            active_openvpn_node_id,
+            list(reserved_slot_candidate_ids()),
+        )
+        protected_ids.update(main_assignment_coordinator.reserved_candidate_ids())
+        rebalanced = node_pool.rebalance_valid_pool(
+            updated, [], protected_ids, set(), limit=30
+        )
+        if (
+            candidate_id not in {str(item.get("id") or "") for item in rebalanced}
+            and len(rebalanced) < 30
+        ):
+            rebalanced.append(failed)
+        write_json(BLACKLIST_FILE, blacklist)
+        write_json(NODES_FILE, rebalanced)
+    return True
+
 def row_to_node(row: dict[str, str], config_text: str) -> dict[str, Any]:
     ip = row.get("IP", "")
     country_short = row.get("CountryShort", "")
@@ -1721,6 +1848,23 @@ def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bo
         stop_process(process)
         process = None
     return ok, message, process
+
+
+def _candidate_dial_failure_code(openvpn_message: str) -> str:
+    """只把 OpenVPN 明确指向远端候选的启动错误分类为候选故障。"""
+    normalized = str(openvpn_message or "").strip().lower()
+    if any(
+        marker in normalized
+        for marker in (
+            "auth_failed",
+            "authentication failed",
+            "err_ovpn_auth_failed",
+            "connection refused",
+            "err_ovpn_conn_refused",
+        )
+    ):
+        return "candidate_dial_failed"
+    return ""
 
 
 def setup_policy_routing(interface: str = "tun0", table: int = 100) -> bool:
@@ -2250,23 +2394,41 @@ def _set_country_refresh(**updates: Any) -> dict[str, Any]:
         return dict(country_refresh_state)
 
 
+def _replace_country_refresh(**values: Any) -> dict[str, Any]:
+    with country_refresh_lock:
+        country_refresh_state.clear()
+        country_refresh_state.update(values)
+        return dict(country_refresh_state)
+
+
 def _country_refresh_worker(country: str, start_gate: threading.Event) -> None:
     start_gate.wait()
     main_assignment_thread.country_refresh_authorized = True
     try:
         result = refresh_country_nodes(country, _lock_held=True)
-        _set_country_refresh(
-            **{**result, "phase": "", "finishedAt": time.time(), "errorCode": ""}
-        )
+        with country_refresh_lock:
+            started_at = float(country_refresh_state.get("startedAt") or 0)
+        final = dict(result)
+        final.update(phase="", finishedAt=time.time())
+        if started_at:
+            final["startedAt"] = started_at
+        _replace_country_refresh(**final)
     except Exception:
-        _set_country_refresh(
+        with country_refresh_lock:
+            started_at = float(country_refresh_state.get("startedAt") or 0)
+        _replace_country_refresh(
             state="failed",
+            country=country,
             phase="",
+            startedAt=started_at,
             finishedAt=time.time(),
-            errorCode="refresh_failed",
+            resultCode="upstream_unavailable",
+            errorCode="upstream_unavailable",
         )
     finally:
         main_assignment_thread.country_refresh_authorized = False
+        if maintenance_lock.locked():
+            maintenance_lock.release()
 
 
 def start_country_refresh(country: str) -> dict[str, Any]:
@@ -2274,21 +2436,33 @@ def start_country_refresh(country: str) -> dict[str, Any]:
     if not re.fullmatch(r"[A-Z]{2}", normalized_country):
         return {"state": "failed", "country": normalized_country, "errorCode": "invalid_country"}
     if not _acquire_runtime_mutation():
-        return {"state": "failed", "country": normalized_country, "errorCode": "operation_busy"}
+        return {
+            "state": "failed", "country": normalized_country,
+            "resultCode": "operation_busy", "errorCode": "operation_busy",
+        }
     with country_refresh_lock:
         if country_refresh_state.get("state") == "running":
             _release_runtime_mutation()
-            return {"state": "failed", "country": normalized_country, "errorCode": "maintenance_busy"}
+            return {
+                "state": "failed", "country": normalized_country,
+                "resultCode": "maintenance_busy", "errorCode": "maintenance_busy",
+            }
     if not maintenance_lock.acquire(blocking=False):
         _release_runtime_mutation()
-        return {"state": "failed", "country": normalized_country, "errorCode": "maintenance_busy"}
-    accepted = _set_country_refresh(
+        return {
+            "state": "failed", "country": normalized_country,
+            "resultCode": "maintenance_busy", "errorCode": "maintenance_busy",
+        }
+    accepted = _replace_country_refresh(
         state="running",
         country=normalized_country,
         phase="fetching",
         catalogCount=0,
+        officialCount=0,
         countryCandidateCount=0,
         testedCount=0,
+        usableCount=0,
+        retainedCount=0,
         validCount=0,
         preservedCount=0,
         startedAt=time.time(),
@@ -2310,6 +2484,7 @@ def start_country_refresh(country: str) -> dict[str, Any]:
             state="failed",
             phase="",
             finishedAt=time.time(),
+            resultCode="upstream_unavailable",
             errorCode="worker_start_failed",
         )
     _release_runtime_mutation()
@@ -2317,7 +2492,10 @@ def start_country_refresh(country: str) -> dict[str, Any]:
     return accepted
 
 
-@_mutation_guard({"state": "failed", "country": "", "errorCode": "operation_busy"})
+@_mutation_guard({
+    "state": "failed", "country": "", "resultCode": "operation_busy",
+    "errorCode": "operation_busy",
+})
 def refresh_country_nodes(
     country: str,
     target_size: int = 5,
@@ -2329,13 +2507,34 @@ def refresh_country_nodes(
     if not re.fullmatch(r"[A-Z]{2}", normalized_country):
         return {"state": "failed", "country": normalized_country, "errorCode": "invalid_country"}
     if not main_mutation_allowed():
-        return {"state": "failed", "country": normalized_country, "errorCode": "operation_busy"}
+        return {
+            "state": "failed", "country": normalized_country,
+            "resultCode": "operation_busy", "errorCode": "operation_busy",
+        }
     if not _lock_held and not maintenance_lock.acquire(blocking=False):
-        return {"state": "failed", "country": normalized_country, "errorCode": "maintenance_busy"}
+        return {
+            "state": "failed", "country": normalized_country,
+            "resultCode": "maintenance_busy", "errorCode": "maintenance_busy",
+        }
 
     try:
         existing_nodes = read_nodes()
-        candidates = fetch_candidates(normalized_country)
+        try:
+            candidates = fetch_candidates(normalized_country)
+            catalog = country_catalog_snapshot()
+        except Exception:
+            return {
+                "state": "failed",
+                "country": normalized_country,
+                "resultCode": "upstream_unavailable",
+                "errorCode": "upstream_unavailable",
+                "officialCount": 0,
+                "testedCount": 0,
+                "usableCount": 0,
+                "retainedCount": 0,
+                "cacheTotal": len(existing_nodes),
+                "finishedAt": time.time(),
+            }
         candidates.sort(
             key=lambda item: (
                 0 if str(item.get("ip_type") or "").lower() in ("residential", "mobile") else 1,
@@ -2345,12 +2544,18 @@ def refresh_country_nodes(
         )
         catalog_count = sum(
             max(0, parse_int(item.get("candidateCount")))
-            for item in country_catalog_snapshot()
+            for item in catalog
+        )
+        official_count = sum(
+            max(0, parse_int(item.get("candidateCount")))
+            for item in catalog
+            if str(item.get("code") or "").strip().upper() == normalized_country
         )
         if _lock_held:
             _set_country_refresh(
                 phase="probing",
                 catalogCount=catalog_count,
+                officialCount=official_count,
                 countryCandidateCount=len(candidates),
             )
         protected_ids = node_pool.protected_node_ids(
@@ -2458,15 +2663,24 @@ def refresh_country_nodes(
         result = {
             "state": "completed",
             "country": normalized_country,
+            "resultCode": (
+                "no_official_candidates"
+                if official_count == 0
+                else "success" if valid_count > 0 else "no_usable_nodes"
+            ),
             "catalogCount": catalog_count,
+            "officialCount": official_count,
             "countryCandidateCount": len(candidates),
             "testedCount": tested_count,
+            "usableCount": valid_count,
+            "retainedCount": len(protected_country_nodes),
             "validCount": valid_count,
             "preservedCount": len(protected_country_nodes),
             "stopReason": stop_reason,
             "cacheTotal": len(merged),
             "countryValidCount": valid_count,
             "finishedAt": time.time(),
+            "errorCode": "",
         }
         metadata["manualProtectedIds"] = sorted(manual_ids)
         metadata["manualProtectionExpiresRound"] = int(metadata.get("maintenanceRound") or 0) + 1
@@ -2475,7 +2689,8 @@ def refresh_country_nodes(
         set_state(last_check_at=time.time(), last_check_message=f"国家 {normalized_country} 节点刷新完成")
         return result
     finally:
-        maintenance_lock.release()
+        if not _lock_held:
+            maintenance_lock.release()
 
 def mark_main_bad_node(node_id: str) -> None:
     """把主连接出口不通的节点加入冷却名单，冷却期内 auto_switch_node 不会再选回它。"""
@@ -2663,18 +2878,21 @@ def connect_node(node_id: str) -> str:
                     config_path.unlink()
             except Exception:
                 pass
-            node["probe_status"] = "unavailable"
-            node["probe_message"] = message
-            mark_blacklisted(node, message)
-            for item in nodes:
+            failure_code = _candidate_dial_failure_code(message)
+            if failure_code:
+                mark_candidate_unavailable(node_id, failure_code)
+            persisted_nodes = read_nodes()
+            for item in persisted_nodes:
                 item["active"] = False
-            write_json(NODES_FILE, sort_all_nodes(nodes))
+            write_json(NODES_FILE, persisted_nodes)
             log_to_json("ERROR", "VPN", f"连接节点 {node_id} 失败: {message}")
             print(f"[连接核心失败] 无法与 VPN 节点 {node_id} 建立隧道连接！详情: {message}", flush=True)
             set_state(active_openvpn_node_id="", is_connecting=False, active_node_latency="无活动连接", last_check_message=f"连接失败: {message}")
             with lock:
                 active_openvpn_node_id = ""
-            raise RuntimeError(message)
+            if failure_code:
+                raise CandidateUnavailableError(failure_code, persisted=True)
+            raise RuntimeError("openvpn_start_failed")
             
         with lock:
             active_openvpn_process = process
@@ -3496,6 +3714,7 @@ def ensure_slot_proxy(i: int) -> None:
 
 @_mutation_guard(False)
 def bring_up_slot(i: int, node: dict[str, Any]) -> bool:
+    main_assignment_thread.slot_candidate_failure_code = ""
     candidate_id = str(node.get("id") or "").strip()
     if candidate_id in (
         main_reserved_candidate_ids()
@@ -3525,6 +3744,11 @@ def bring_up_slot(i: int, node: dict[str, Any]) -> bool:
                 cfg_path.unlink()
         except Exception:
             pass
+        failure_code = _candidate_dial_failure_code(message)
+        if candidate_id and failure_code and mark_candidate_unavailable(
+            candidate_id, failure_code
+        ):
+            main_assignment_thread.slot_candidate_failure_code = failure_code
         return False
 
     if not setup_policy_routing(dev, slot_table(i)):
@@ -3720,7 +3944,10 @@ def switch_slot_node(i: int, lock_timeout: float = 0) -> dict[str, Any]:
             slot_bad_nodes[failed_node_id] = time.time() + SLOT_BAD_NODE_COOLDOWN
         mark_slot_pending(i, "手动切换后连接失败，待自动重试")
         write_slots_state()
-        return {"ok": False, "error": f"切换到节点 {picks[0].get('id')} 失败，将自动重试"}
+        failure_code = str(
+            getattr(main_assignment_thread, "slot_candidate_failure_code", "") or ""
+        )
+        return _candidate_failure_response(failure_code, "assign_failed")
     finally:
         exit_slots_supervise_lock.release()
 
@@ -3762,7 +3989,10 @@ def assign_node_to_slot(i: int, node_id: str) -> dict[str, Any]:
             return {"ok": True, "slot": i, "ip": node.get("ip"), "country": node.get("country")}
         mark_slot_pending(i, f"分配节点 {node_id} 后连接失败，待自动重试")
         write_slots_state()
-        return {"ok": False, "error": f"分配到槽位 #{i} 失败，将自动重试"}
+        failure_code = str(
+            getattr(main_assignment_thread, "slot_candidate_failure_code", "") or ""
+        )
+        return _candidate_failure_response(failure_code, "assign_failed")
     finally:
         exit_slots_supervise_lock.release()
 
@@ -3895,8 +4125,17 @@ def assign_managed_slot(i: int, node_id: str, country: str = "", proxy_type: str
     if old_node_id and old_node_id != node_id:
         restored = assign_node_to_slot(slot, old_node_id)
         if not restored.get("ok"):
-            return {"ok": False, "error_code": "rollback_failed"}
-    return {"ok": False, "error_code": "assign_failed"}
+            return {
+                "ok": False,
+                "state": "repair_required",
+                "error_code": "rollback_failed",
+                "candidate_rejected": result.get("candidate_rejected") is True,
+            }
+    failure_code = str(result.get("error_code") or "")
+    return _candidate_failure_response(
+        failure_code if result.get("candidate_rejected") is True else "",
+        "assign_failed",
+    )
 
 @_mutation_guard({"ok": False, "error_code": "operation_busy"})
 def create_managed_slot(country: str, proxy_type: str, candidate_id: str = "") -> dict[str, Any]:
@@ -3927,10 +4166,12 @@ def create_managed_slot(country: str, proxy_type: str, candidate_id: str = "") -
         )
     if not candidates:
         return {"ok": False, "error_code": "no_matching_candidate"}
+    last_failure: dict[str, Any] = {}
     for candidate in candidates:
         node_id = str(candidate.get("id") or "")
         result = add_slot_with_node(node_id)
         if not result.get("ok"):
+            last_failure = dict(result)
             if node_id:
                 slot_bad_nodes[node_id] = time.time() + SLOT_BAD_NODE_COOLDOWN
             continue
@@ -3942,17 +4183,27 @@ def create_managed_slot(country: str, proxy_type: str, candidate_id: str = "") -
         except Exception:
             delete_slot(slot)
             return {"ok": False, "error_code": "slot_configuration_failed"}
-    return {"ok": False, "error_code": "slot_create_failed"}
+    return _candidate_failure_response(
+        str(last_failure.get("error_code") or "")
+        if last_failure.get("candidate_rejected") is True else "",
+        "slot_create_failed",
+    )
 
 @_mutation_guard({"ok": False, "error_code": "operation_busy"})
 def rotate_managed_slot(i: int) -> dict[str, Any]:
     if not main_mutation_allowed():
         return {"ok": False, "error_code": "operation_busy"}
+    last_failure: dict[str, Any] = {}
     for _ in range(MANAGED_SLOT_CANDIDATE_ATTEMPTS):
         result = switch_slot_node(i, lock_timeout=10)
         if result.get("ok"):
             return managed_slot_snapshot(i)
-    return {"ok": False, "error_code": "slot_rotate_failed"}
+        last_failure = dict(result)
+    return _candidate_failure_response(
+        str(last_failure.get("error_code") or "")
+        if last_failure.get("candidate_rejected") is True else "",
+        "slot_rotate_failed",
+    )
 
 @_mutation_guard({"ok": False, "error_code": "operation_busy"})
 def check_managed_slot(i: int) -> dict[str, Any]:
@@ -3968,6 +4219,28 @@ def check_managed_slot(i: int) -> dict[str, Any]:
             slot["exit_ip"] = exit_ip
             slot["egress_checked_at"] = checked_at
     write_slots_state()
+    if not ok:
+        candidate_id = str(snapshot.get("node_id") or "").strip()
+        tunnel_running = slot_process_alive(i)
+        tunnel_egress_ok = False
+        if tunnel_running:
+            tunnel_egress_ok, _tunnel_exit_ip = check_interface_exit_ip(
+                slot_device(i)
+            )
+        if tunnel_egress_ok or not tunnel_running:
+            return {
+                "ok": False,
+                "error_code": "egress_check_failed",
+                "candidate_rejected": False,
+            }
+        rejected = bool(candidate_id and mark_candidate_unavailable(
+            candidate_id, "candidate_egress_failed"
+        ))
+        return {
+            "ok": False,
+            "error_code": "candidate_egress_failed",
+            "candidate_rejected": rejected,
+        }
     snapshot = managed_slot_snapshot(i)
     snapshot["egress_ok"] = ok
     snapshot["exit_ip"] = exit_ip
