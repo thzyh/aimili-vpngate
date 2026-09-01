@@ -606,7 +606,7 @@ def safe_main_status() -> dict[str, Any]:
         "exit_ip": str(state.get("proxy_ip") or "") if state.get("proxy_ok") else "",
         "port": int(state.get("proxy_port") or LOCAL_PROXY_PORT),
         "egress_ok": bool(state.get("proxy_ok")),
-        "active": bool(active_id) and not bool(state.get("is_connecting")),
+        "active": bool(active_id) and active_openvpn_running(),
     }
 
 

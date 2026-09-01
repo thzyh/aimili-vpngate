@@ -1016,6 +1016,27 @@ class ManagerMainAssignmentTests(unittest.TestCase):
 
         self.assertEqual(status["proxy_type"], "datacenter")
 
+    def test_safe_main_status_stays_active_during_pool_candidate_probes(self):
+        manager.is_connecting = True
+        with (
+            mock.patch.object(manager, "read_nodes", return_value=self.nodes),
+            mock.patch.object(manager, "active_openvpn_running", return_value=True),
+            mock.patch.object(
+                manager,
+                "get_state",
+                return_value={
+                    "proxy_ok": True,
+                    "proxy_ip": "198.51.100.90",
+                    "proxy_port": 7928,
+                    "is_connecting": True,
+                },
+            ),
+        ):
+            status = manager.safe_main_status()
+
+        self.assertTrue(status["active"])
+        self.assertTrue(status["egress_ok"])
+
     def test_manager_rollback_reconnects_previous_main_and_restores_settings(self):
         settings = {
             "connection_enabled": True,
