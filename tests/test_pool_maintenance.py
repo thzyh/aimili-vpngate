@@ -89,7 +89,15 @@ class PoolMaintenanceTests(unittest.TestCase):
         stored_nodes = []
 
         def probe(batch):
-            return [dict(item, probe_status="available") for item in batch]
+            return [
+                dict(
+                    item,
+                    probe_status="available",
+                    exit_ip=f"203.0.113.{index + 10}",
+                    exit_ip_checked_at=1_700_000_000 + index,
+                )
+                for index, item in enumerate(batch)
+            ]
 
         def store(path, payload):
             if path == manager.NODES_FILE:
@@ -113,6 +121,8 @@ class PoolMaintenanceTests(unittest.TestCase):
             [item["id"] for item in stored_nodes],
             ["jp-slot", "jp-new-0", "jp-new-1", "jp-new-2", "jp-new-3", "us-existing", "jp-old"],
         )
+        refreshed = [item for item in stored_nodes if item["id"].startswith("jp-new-")]
+        self.assertTrue(all(item.get("exit_ip") for item in refreshed))
 
     def test_country_refresh_stops_after_twenty_failed_real_probes(self):
         candidates = [country_node(f"jp-{index}", "JP") for index in range(30)]

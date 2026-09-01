@@ -43,6 +43,8 @@ class FakeManager:
                 "country_short": "JP",
                 "country": "Japan",
                 "ip": "198.51.100.10",
+                "exit_ip": "203.0.113.10",
+                "exit_ip_checked_at": 1_700_000_005,
                 "proxy_type": "datacenter",
                 "probe_status": "available",
             }
@@ -421,6 +423,9 @@ class ControlAPITests(unittest.TestCase):
         status, _, payload = self.request("GET", "/control/v1/candidates")
         self.assertEqual(status, 200)
         self.assertEqual(payload["data"][0]["id"], "node-safe")
+        self.assertEqual(payload["data"][0]["ip"], "198.51.100.10")
+        self.assertEqual(payload["data"][0]["exit_ip"], "203.0.113.10")
+        self.assertEqual(payload["data"][0]["exit_ip_checked_at"], 1_700_000_005)
         self.assertNotIn("config_text", json.dumps(payload))
 
     def test_create_slot_normalizes_country_and_preserves_closed_type(self):

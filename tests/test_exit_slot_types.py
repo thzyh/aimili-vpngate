@@ -36,6 +36,8 @@ class ExitSlotTypeTests(unittest.TestCase):
             "score": 123,
             "probe_status": "available",
             "last_probe_at": 1_700_000_000,
+            "exit_ip": "203.0.113.10",
+            "exit_ip_checked_at": 1_700_000_005,
             "config_text": "secret openvpn profile",
             "config_file": "secret.ovpn",
         }
@@ -60,6 +62,8 @@ class ExitSlotTypeTests(unittest.TestCase):
                     "score": 123,
                     "probe_status": "available",
                     "last_probe_at": 1_700_000_000,
+                    "exit_ip": "203.0.113.10",
+                    "exit_ip_checked_at": 1_700_000_005,
                 }
             ],
         )

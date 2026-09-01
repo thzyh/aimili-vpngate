@@ -5,6 +5,7 @@ import base64
 import csv
 import functools
 import hmac
+import ipaddress
 import json
 import os
 import queue
@@ -123,6 +124,7 @@ PROBE_FAILURE_COOLDOWN_SECONDS = env_int("PROBE_FAILURE_COOLDOWN_SECONDS", 1800,
 OPENVPN_TEST_TIMEOUT_SECONDS = env_int("OPENVPN_TEST_TIMEOUT_SECONDS", 35, 1)
 OPENVPN_TEST_CONCURRENCY = env_int("OPENVPN_TEST_CONCURRENCY", 8, 1, 64)
 TCP_PRESCREEN_CONCURRENCY = env_int("TCP_PRESCREEN_CONCURRENCY", 100, 1, 512)
+TEST_ROUTE_TABLE_BASE = 61000
 COLLECTOR_INITIAL_DELAY_SECONDS = env_int("COLLECTOR_INITIAL_DELAY_SECONDS", 0, 0)
 COLLECTOR_FAILURE_BACKOFF_SECONDS = env_int("COLLECTOR_FAILURE_BACKOFF_SECONDS", 30, 30)
 
@@ -1944,6 +1946,38 @@ def tcp_prescreen_dead(nodes: list[dict[str, Any]]) -> dict[str, dict[str, Any]]
         list(executor.map(probe, tcp_nodes))
     return dead
 
+
+def check_interface_exit_ip(interface: str, timeout: int = 6) -> tuple[bool, str]:
+    """通过指定测试隧道读取并校验公网出口 IP。"""
+    for url in ("https://api.ipify.org", "https://icanhazip.com"):
+        try:
+            result = subprocess.run(
+                [
+                    "curl",
+                    "--silent",
+                    "--show-error",
+                    "--interface",
+                    interface,
+                    url,
+                    "--max-time",
+                    str(timeout),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=timeout + 2,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        value = (result.stdout or "").strip()
+        if result.returncode != 0 or not value:
+            continue
+        try:
+            ipaddress.ip_address(value)
+        except ValueError:
+            continue
+        return True, value
+    return False, ""
+
 def _probe_one_node(node: dict[str, Any]) -> dict[str, Any]:
     """完整验证单个节点，但不读取或写入节点池。"""
     node_id = node["id"]
@@ -1972,16 +2006,39 @@ def _probe_one_node(node: dict[str, Any]) -> dict[str, Any]:
 
     latency = vpn_utils.ping_latency_ms(host, port, fallback_ping)
     tun_index = None
+    test_route_table = None
+    process = None
+    exit_ip = ""
+    exit_ip_checked_at = 0.0
     try:
         tun_index = get_free_test_index()
-        ok, message, _ = run_openvpn_until_ready(
+        ok, message, process = run_openvpn_until_ready(
             str(temp_path),
-            keep_alive=False,
+            keep_alive=True,
             route_nopull=True,
             timeout=12,
             dev=f"tun{tun_index}",
         )
+        if ok:
+            test_route_table = TEST_ROUTE_TABLE_BASE + tun_index
+            if not setup_policy_routing(f"tun{tun_index}", test_route_table):
+                ok = False
+                message = "临时出口路由配置失败"
+            else:
+                try:
+                    exit_ok, exit_ip = check_interface_exit_ip(f"tun{tun_index}")
+                except Exception:
+                    exit_ok = False
+                    exit_ip = ""
+                if exit_ok:
+                    exit_ip_checked_at = time.time()
+                else:
+                    ok = False
+                    message = "公网出口检测失败"
     finally:
+        if test_route_table is not None:
+            cleanup_policy_routing(test_route_table)
+        stop_process(process)
         if tun_index is not None:
             release_test_index(tun_index)
         try:
@@ -1989,7 +2046,7 @@ def _probe_one_node(node: dict[str, Any]) -> dict[str, Any]:
         except OSError:
             pass
 
-    return {
+    result = {
         **node,
         "ip": node.get("ip") or host,
         "remote_host": host,
@@ -2005,6 +2062,10 @@ def _probe_one_node(node: dict[str, Any]) -> dict[str, Any]:
         "ip_type": "",
         "quality": "",
     }
+    if ok:
+        result["exit_ip"] = exit_ip
+        result["exit_ip_checked_at"] = exit_ip_checked_at
+    return result
 
 
 def probe_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -3158,7 +3219,8 @@ def safe_candidate_snapshot() -> list[dict[str, Any]]:
     """返回控制 API 可公开的候选字段，不携带 OpenVPN 配置。"""
     fields = (
         "id", "country_short", "country", "ip", "owner", "asn", "as_name",
-        "latency_ms", "score", "probe_status", "last_probe_at",
+        "latency_ms", "score", "probe_status", "last_probe_at", "exit_ip",
+        "exit_ip_checked_at",
     )
     reserved = (
         {str(active_openvpn_node_id or "").strip()}
