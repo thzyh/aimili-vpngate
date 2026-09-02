@@ -2284,8 +2284,15 @@ def replenish_valid_pool(
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], dict[str, Any]]:
     """复验既有节点并分批补池，直到达到目标或候选耗尽。"""
     checked_at = time.time() if now is None else now
-    pool = node_pool.protected_active_nodes(existing_nodes, active_openvpn_node_id)
-    protected_ids = {str(item.get("id") or "") for item in pool}
+    protected_ids = node_pool.protected_node_ids(
+        active_openvpn_node_id,
+        [*current_slot_node_ids(), *get_slot_pin_map().values()],
+    )
+    pool = [
+        item
+        for item in existing_nodes
+        if str(item.get("id") or "").strip() in protected_ids
+    ]
     failed_entries = dict(blacklist)
     for item in existing_nodes:
         node_id = str(item.get("id") or "")

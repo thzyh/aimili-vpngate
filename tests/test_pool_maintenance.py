@@ -341,6 +341,36 @@ class PoolMaintenanceTests(unittest.TestCase):
             manager.active_openvpn_node_id = ""
         self.assertEqual([item["id"] for item in stored], ["n1", "live"])
 
+    def test_replenish_preserves_running_and_pinned_managed_slot_nodes(self):
+        existing = [
+            {**node(0, "available"), "id": "main-live"},
+            {**node(1, "available"), "id": "slot-live"},
+            {**node(2, "available"), "id": "slot-pinned"},
+        ]
+        manager.active_openvpn_node_id = "main-live"
+        try:
+            with (
+                mock.patch.object(manager, "TARGET_VALID_POOL_SIZE", 3),
+                mock.patch.object(manager, "current_slot_node_ids", return_value={"slot-live"}),
+                mock.patch.object(manager, "get_slot_pin_map", return_value={"2": "slot-pinned"}),
+            ):
+                pool, _, stats = manager.replenish_valid_pool(
+                    existing,
+                    [],
+                    {},
+                    lambda _batch: self.fail("protected nodes must not be reprobed"),
+                    now=100.0,
+                )
+        finally:
+            manager.active_openvpn_node_id = ""
+
+        self.assertEqual(
+            [item["id"] for item in pool],
+            ["main-live", "slot-live", "slot-pinned"],
+        )
+        self.assertEqual(stats["tested"], 0)
+        self.assertEqual(stats["stop_reason"], "target_reached")
+
     def test_replenishes_from_later_candidates_until_target(self):
         existing = [
             node(0, "available"),
