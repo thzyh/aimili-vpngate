@@ -23,6 +23,19 @@ class ExitSlotTypeTests(unittest.TestCase):
             "candidate_dial_failed",
         )
 
+    def test_diagnosed_remote_timeout_is_a_persistable_candidate_dial_failure(self):
+        code, message = manager.vpn_utils.diagnose_openvpn_failure([
+            "TCP: connect to remote failed: Connection timed out",
+            "Exiting due to fatal error",
+        ])
+
+        self.assertEqual(code, 2004)
+        self.assertIn("ERR_OVPN_NODE_UNREACHABLE", message)
+        self.assertEqual(
+            manager._candidate_dial_failure_code(message),
+            "candidate_dial_failed",
+        )
+
     def test_mark_candidate_unavailable_persists_blacklist_and_pool_state(self):
         candidate = {
             "id": "jp-stale",

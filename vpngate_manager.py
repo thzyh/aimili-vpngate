@@ -1862,6 +1862,7 @@ def _candidate_dial_failure_code(openvpn_message: str) -> str:
             "connection refused",
             "err_ovpn_conn_refused",
             "err_ovpn_no_route_to_host",
+            "err_ovpn_node_unreachable",
         )
     ):
         return "candidate_dial_failed"
