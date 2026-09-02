@@ -503,6 +503,40 @@ class ManagedSlotFacadeTests(unittest.TestCase):
             },
         )
 
+    def test_assign_pending_slot_does_not_restore_a_stale_pin(self):
+        candidate = {
+            "id": "jp-new",
+            "country_short": "JP",
+            "country": "Japan",
+            "ip_type": "hosting",
+            "probe_status": "available",
+        }
+        assign = mock.Mock(return_value={
+            "ok": False,
+            "error_code": "candidate_dial_failed",
+            "candidate_rejected": True,
+        })
+        clear_pin = mock.Mock()
+        with (
+            mock.patch.object(manager, "get_active_slots", return_value=[2]),
+            mock.patch.object(manager, "read_nodes", return_value=[candidate]),
+            mock.patch.object(manager, "reserved_slot_candidate_ids", return_value=set()),
+            mock.patch.object(manager, "exit_slots", {2: {"node_id": "", "status": "pending"}}),
+            mock.patch.object(manager, "get_slot_pin_map", return_value={"2": "jp-stale"}),
+            mock.patch.object(manager, "get_slot_country_map", return_value={"2": "US"}),
+            mock.patch.object(manager, "get_slot_type_map", return_value={"2": "residential"}),
+            mock.patch.object(manager, "set_slot_country"),
+            mock.patch.object(manager, "set_slot_type"),
+            mock.patch.object(manager, "set_slot_pin", clear_pin),
+            mock.patch.object(manager, "assign_node_to_slot", assign),
+        ):
+            result = manager.assign_managed_slot(2, "jp-new", "JP", "datacenter")
+
+        self.assertEqual(assign.call_count, 1)
+        clear_pin.assert_called_once_with(2, "")
+        self.assertEqual(result["error_code"], "candidate_dial_failed")
+        self.assertTrue(result["candidate_rejected"])
+
     def test_slot_orphan_cleanup_matches_only_the_exact_managed_slot(self):
         with tempfile.TemporaryDirectory() as directory:
             proc_root = Path(directory)

@@ -4113,6 +4113,7 @@ def assign_managed_slot(i: int, node_id: str, country: str = "", proxy_type: str
                 return {"ok": False, "error_code": "candidate_in_use"}
         previous = dict(exit_slots.get(slot) or {})
     old_node_id = str(previous.get("node_id") or get_slot_pin_map().get(str(slot)) or "").strip()
+    previous_ready = previous.get("status") == "up" and bool(old_node_id)
     old_country = get_slot_country_map().get(str(slot), "")
     old_type = get_slot_type_map().get(str(slot), "")
     set_slot_country(slot, normalized_country)
@@ -4130,7 +4131,7 @@ def assign_managed_slot(i: int, node_id: str, country: str = "", proxy_type: str
         set_slot_type(slot, old_type)
     else:
         set_slot_type(slot, "")
-    if old_node_id and old_node_id != node_id:
+    if previous_ready and old_node_id != node_id:
         restored = assign_node_to_slot(slot, old_node_id)
         if not restored.get("ok"):
             return {
@@ -4139,6 +4140,8 @@ def assign_managed_slot(i: int, node_id: str, country: str = "", proxy_type: str
                 "error_code": "rollback_failed",
                 "candidate_rejected": result.get("candidate_rejected") is True,
             }
+    elif not previous_ready:
+        set_slot_pin(slot, "")
     failure_code = str(result.get("error_code") or "")
     return _candidate_failure_response(
         failure_code if result.get("candidate_rejected") is True else "",
