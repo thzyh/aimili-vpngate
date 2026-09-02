@@ -335,6 +335,61 @@ class ManagedSlotFacadeTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         delete.assert_called_once_with(0)
 
+    def test_assign_managed_slot_hides_a_candidate_that_fails_to_dial(self):
+        candidate = {"id": "jp-stale", "country_short": "JP", "ip_type": "hosting", "probe_status": "available"}
+        previous = {"node_id": "kr-old", "country_short": "KR", "proxy_type": "datacenter"}
+        with (
+            mock.patch.object(manager, "read_nodes", return_value=[candidate]),
+            mock.patch.object(manager, "get_active_slots", return_value=[2]),
+            mock.patch.object(manager, "get_slot_country_map", return_value={"2": "KR"}),
+            mock.patch.object(manager, "get_slot_type_map", return_value={"2": "datacenter"}),
+            mock.patch.object(manager, "exit_slots", {2: previous}),
+            mock.patch.object(manager, "assign_node_to_slot", side_effect=[{"ok": False, "error_code": "candidate_dial_failed", "error": "dial failed"}, {"ok": True}]),
+            mock.patch.object(manager, "mark_blacklisted") as blacklist,
+        ):
+            result = manager.assign_managed_slot(2, "jp-stale", "JP", "datacenter")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_code"], "assign_failed")
+        blacklist.assert_called_once_with(candidate, "分配到出口位失败：dial failed")
+
+    def test_assign_managed_slot_does_not_reject_a_candidate_when_the_slot_supervisor_is_busy(self):
+        candidate = {"id": "jp-wait", "country_short": "JP", "ip_type": "hosting", "probe_status": "available"}
+        previous = {"node_id": "kr-old", "country_short": "KR", "proxy_type": "datacenter"}
+        with (
+            mock.patch.object(manager, "read_nodes", return_value=[candidate]),
+            mock.patch.object(manager, "get_active_slots", return_value=[2]),
+            mock.patch.object(manager, "get_slot_country_map", return_value={"2": "KR"}),
+            mock.patch.object(manager, "get_slot_type_map", return_value={"2": "datacenter"}),
+            mock.patch.object(manager, "exit_slots", {2: previous}),
+            mock.patch.object(manager, "assign_node_to_slot", side_effect=[{"ok": False, "error_code": "operation_busy", "error": "供给器正忙"}, {"ok": True}]),
+            mock.patch.object(manager, "mark_blacklisted") as blacklist,
+        ):
+            result = manager.assign_managed_slot(2, "jp-wait", "JP", "datacenter")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_code"], "assign_failed")
+        blacklist.assert_not_called()
+
+    def test_assign_node_to_slot_marks_only_a_real_dial_failure(self):
+        candidate = {"id": "jp-dial", "probe_status": "available"}
+        with (
+            mock.patch.object(manager, "get_exit_slot_config", return_value={"active": [2], "paused": [], "residential_only": False}),
+            mock.patch.object(manager, "read_nodes", return_value=[candidate]),
+            mock.patch.object(manager, "exit_slots", {}),
+            mock.patch.object(manager, "load_ui_config", return_value={}),
+            mock.patch.object(manager, "get_paused_slots", return_value=set()),
+            mock.patch.object(manager, "_save_slot_lists"),
+            mock.patch.object(manager, "set_slot_pin"),
+            mock.patch.object(manager, "tear_down_slot"),
+            mock.patch.object(manager, "bring_up_slot", return_value=False),
+            mock.patch.object(manager, "mark_slot_pending"),
+            mock.patch.object(manager, "write_slots_state"),
+        ):
+            result = manager.assign_node_to_slot(2, "jp-dial")
+
+        self.assertEqual(result["error_code"], "candidate_dial_failed")
+
     def test_rotate_managed_slot_retries_after_a_stale_candidate(self):
         expected = {"ok": True, "slot": 0, "node_id": "jp-live", "status": "up"}
         with (

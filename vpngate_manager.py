@@ -2990,7 +2990,7 @@ def assign_node_to_slot(i: int, node_id: str) -> dict[str, Any]:
             return {"ok": True, "slot": i, "ip": node.get("ip"), "country": node.get("country")}
         mark_slot_pending(i, f"分配节点 {node_id} 后连接失败，待自动重试")
         write_slots_state()
-        return {"ok": False, "error": f"分配到槽位 #{i} 失败，将自动重试"}
+        return {"ok": False, "error_code": "candidate_dial_failed", "error": f"分配到槽位 #{i} 失败，将自动重试"}
     finally:
         exit_slots_supervise_lock.release()
 
@@ -3099,6 +3099,8 @@ def assign_managed_slot(i: int, node_id: str, country: str = "", proxy_type: str
         snapshot = managed_slot_snapshot(slot)
         snapshot["ok"] = True
         return snapshot
+    if result.get("error_code") == "candidate_dial_failed":
+        mark_blacklisted(node, f"分配到出口位失败：{str(result.get('error') or '拨号失败')}")
     if old_country:
         set_slot_country(slot, old_country)
     else:
