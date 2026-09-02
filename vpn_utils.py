@@ -586,6 +586,8 @@ def diagnose_openvpn_failure(log_tail: list[str]) -> tuple[int, str]:
         
     if "connection timed out" in joined_log or "timeout" in joined_log:
         return 2004, "[ERR_OVPN_NODE_UNREACHABLE] 节点连接超时。原因: 远程节点已关机、VPS 本身出站流量被本地防火墙拦截，或者目的 IP:端口遭 ISP/GFW 屏蔽拦截。"
+    if "no route to host" in joined_log:
+        return 2004, "[ERR_OVPN_NO_ROUTE_TO_HOST] 节点当前不可达。原因: 远端主机或其网络明确返回无可用路由。"
     if "connection refused" in joined_log:
         return 2004, "[ERR_OVPN_NODE_UNREACHABLE] 节点连接被拒绝。原因: 目的服务器未在指定端口监听，或者主动拒绝了连接。"
         
