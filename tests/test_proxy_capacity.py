@@ -17,6 +17,24 @@ class FailingThread:
 
 
 class ProxyCapacityTests(unittest.TestCase):
+    def test_default_capacity_keeps_listener_headroom_and_global_isolation(self):
+        capacity = proxy_server.ProxyCapacity(
+            global_limit=proxy_server.MAX_PROXY_CONNECTIONS,
+            per_listener_limit=proxy_server.MAX_PROXY_CONNECTIONS_PER_LISTENER,
+        )
+
+        for _ in range(64):
+            self.assertTrue(capacity.try_acquire("main"))
+        self.assertFalse(capacity.try_acquire("main"))
+
+        for _ in range(64):
+            self.assertTrue(capacity.try_acquire("slot-1"))
+        self.assertFalse(capacity.try_acquire("slot-2"))
+
+        for listener in ("main", "slot-1"):
+            for _ in range(64):
+                capacity.release(listener)
+
     def test_one_listener_exhaustion_does_not_block_another_listener(self):
         capacity = proxy_server.ProxyCapacity(global_limit=4, per_listener_limit=2)
 

@@ -16,9 +16,9 @@ def parse_positive_int(value: str | None, default: int) -> int:
     except (TypeError, ValueError):
         return default
 
-MAX_PROXY_CONNECTIONS = parse_positive_int(os.environ.get("LOCAL_PROXY_MAX_CONNECTIONS"), 24)
+MAX_PROXY_CONNECTIONS = parse_positive_int(os.environ.get("LOCAL_PROXY_MAX_CONNECTIONS"), 128)
 MAX_PROXY_CONNECTIONS_PER_LISTENER = parse_positive_int(
-    os.environ.get("LOCAL_PROXY_MAX_CONNECTIONS_PER_LISTENER"), 6
+    os.environ.get("LOCAL_PROXY_MAX_CONNECTIONS_PER_LISTENER"), 64
 )
 
 

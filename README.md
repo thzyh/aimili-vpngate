@@ -2,7 +2,9 @@
 
 2026-09-01 增量让临时 OpenVPN 精验在销毁隧道前实测并持久化候选公网 `exit_ip`，同时把国家刷新结果收敛为安全闭集；只有明确的候选拨号或出口故障才会原子写入 blacklist 和节点池不可用状态。VPNGate 节点入口地址继续作为 `candidate_ip`，不得冒充公网出口；运行出口数量和 mixed/SOCKS5H 行为不变。
 
-2026-08-31 增量把本地代理容量限制为默认全局 24、每监听实例 6，并补齐 OpenVPN 日志线程/策略路由失败回收、精确槽位孤儿清理和固定 30 条有效节点缓存。单国补充会保留其他国家并立即重平衡；安全元数据持久化在 `pool_metadata.json`，不保存节点配置正文或认证材料。
+2026-09-04 增量根据真实客户端并发把本地代理容量调整为默认全局 128、每监听实例 64；仍保留两级隔离，避免单一出口耗尽全部连接。生产 systemd 使用 `TasksMax=160`，内存上限和出口数量不变。
+
+2026-08-31 增量引入本地代理两级容量限制，并补齐 OpenVPN 日志线程/策略路由失败回收、精确槽位孤儿清理和固定 30 条有效节点缓存。单国补充会保留其他国家并立即重平衡；安全元数据持久化在 `pool_metadata.json`，不保存节点配置正文或认证材料。
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![Zero-Dependency](https://img.shields.io/badge/依赖-零第三方库-success?style=flat-square)](#)
