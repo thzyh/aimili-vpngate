@@ -689,6 +689,35 @@ class ManagedSlotFacadeTests(unittest.TestCase):
         self.assertNotIn("process", snapshots[0])
         self.assertNotIn("config_text", snapshots[0])
 
+    def test_managed_slot_snapshot_replaces_stale_runtime_country_name(self):
+        runtime = {
+            1: {
+                "slot": 1,
+                "country_short": "KR",
+                "country": "越南",
+                "ip_type": "residential",
+                "port": 17929,
+                "status": "up",
+                "node_id": "kr-current",
+            }
+        }
+        current = {
+            "id": "kr-current",
+            "country_short": "KR",
+            "country": "韩国",
+            "ip_type": "residential",
+        }
+        with (
+            mock.patch.object(manager, "exit_slots", runtime),
+            mock.patch.object(manager, "get_slot_country_map", return_value={"1": "KR"}),
+            mock.patch.object(manager, "get_slot_type_map", return_value={"1": "residential"}),
+            mock.patch.object(manager, "read_nodes", return_value=[current]),
+        ):
+            snapshot = manager.managed_slot_snapshot(1)
+
+        self.assertEqual(snapshot["country"], "KR")
+        self.assertEqual(snapshot["country_name"], "韩国")
+
     def test_start_control_plane_uses_explicit_loopback_configuration(self):
         sentinel = object()
         with (

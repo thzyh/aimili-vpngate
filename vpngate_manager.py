@@ -4061,15 +4061,27 @@ def managed_slot_snapshot(i: int) -> dict[str, Any]:
         slot = dict(exit_slots.get(i) or {})
     if not slot:
         return {"ok": False, "error_code": "slot_not_found"}
+    country = str(get_slot_country_map().get(str(i)) or slot.get("country_short") or "").upper()
+    node_id = str(slot.get("node_id") or "")
+    current_node = next(
+        (
+            node
+            for node in read_nodes()
+            if str(node.get("id") or "") == node_id
+            and str(node.get("country_short") or "").strip().upper() == country
+        ),
+        None,
+    )
+    country_name = str((current_node or {}).get("country") or slot.get("country") or "")
     return {
         "ok": True,
         "slot": i,
-        "country": str(get_slot_country_map().get(str(i)) or slot.get("country_short") or "").upper(),
-        "country_name": slot.get("country") or "",
+        "country": country,
+        "country_name": country_name,
         "proxy_type": get_slot_type_map().get(str(i)) or normalize_proxy_type(slot.get("ip_type")),
         "port": parse_int(slot.get("port")) or slot_port(i),
         "status": slot.get("status") or "down",
-        "node_id": slot.get("node_id") or "",
+        "node_id": node_id,
         "candidate_ip": slot.get("ip") or "",
         "exit_ip": slot.get("exit_ip") or "",
         "egress_ok": bool(slot.get("egress_ok")),
