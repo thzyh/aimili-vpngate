@@ -161,7 +161,7 @@ class DockerComposeContractTests(unittest.TestCase):
 
 
 class DockerScriptContractTests(unittest.TestCase):
-    def run_powershell(self, arguments, *, check=True):
+    def run_powershell(self, arguments, *, check=True, env=None):
         completed = subprocess.run(
             [
                 "powershell",
@@ -175,10 +175,33 @@ class DockerScriptContractTests(unittest.TestCase):
             capture_output=True,
             text=True,
             encoding="utf-8",
+            env=env,
         )
         if check:
             self.assertEqual(completed.returncode, 0, completed.stderr)
         return completed
+
+    def test_unavailable_docker_probe_returns_false_under_stop_on_error(self):
+        self.assertTrue(COMMON_SCRIPT.is_file(), "common PowerShell module is missing")
+        with tempfile.TemporaryDirectory() as temporary:
+            fake_docker = pathlib.Path(temporary) / "docker.cmd"
+            fake_docker.write_text(
+                "@echo fake docker unavailable 1>&2\r\n@exit /b 1\r\n",
+                encoding="ascii",
+            )
+            environment = os.environ.copy()
+            environment["PATH"] = temporary + os.pathsep + environment["PATH"]
+            command = (
+                "$ErrorActionPreference='Stop';"
+                f". '{COMMON_SCRIPT}';"
+                "[string](Test-DockerEngineAvailable)"
+            )
+            completed = self.run_powershell(
+                ["-Command", command], check=False, env=environment
+            )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), "False")
 
     def host_guard_snapshot(self):
         command = (

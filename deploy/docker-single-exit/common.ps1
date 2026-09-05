@@ -107,9 +107,13 @@ function Invoke-PrototypeCompose {
     }
 }
 
+function Test-DockerEngineAvailable {
+    & cmd.exe /d /s /c 'docker info --format "{{.ServerVersion}}" >nul 2>nul'
+    return $LASTEXITCODE -eq 0
+}
+
 function Ensure-DockerEngine {
-    & docker info --format '{{.ServerVersion}}' *> $null
-    if ($LASTEXITCODE -eq 0) {
+    if (Test-DockerEngineAvailable) {
         return
     }
     $desktop = Join-Path $env:ProgramFiles 'Docker\Docker\Docker Desktop.exe'
@@ -120,8 +124,7 @@ function Ensure-DockerEngine {
     $deadline = (Get-Date).AddMinutes(3)
     do {
         Start-Sleep -Seconds 3
-        & docker info --format '{{.ServerVersion}}' *> $null
-        if ($LASTEXITCODE -eq 0) {
+        if (Test-DockerEngineAvailable) {
             return
         }
     } while ((Get-Date) -lt $deadline)
