@@ -21,6 +21,7 @@ services:
       VPNGATE_DATA_DIR: /var/lib/aimilivpn
       LOCAL_PROXY_HOST: 0.0.0.0
       LOCAL_PROXY_PORT: "7928"
+      LOCAL_PROXY_REQUIRED_URL: https://www.google.com/generate_204
       UI_HOST: 0.0.0.0
       UI_PORT: "8787"
       AIMILI_CONTROL_ADDRESS: 127.0.0.1:8790

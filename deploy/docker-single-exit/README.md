@@ -33,6 +33,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\deploy\docker-single-exit\
 - `tun0` 存在；
 - 恰好一个 OpenVPN 进程；
 - 经 `127.0.0.1:17928` 的显式代理请求返回有效出口；
+- 经 SOCKS5H 访问 v2rayN 当前延迟检测目标返回 HTTP 204；不满足时 AimiliVPN 会淘汰该免费节点并自动换节点；
 - 代理出口与容器普通 `eth0` 出口不同；
 - v2rayN PID、系统代理、Windows 默认路由和现用代理健康与启动前一致。
 

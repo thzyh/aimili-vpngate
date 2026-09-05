@@ -158,6 +158,7 @@ OPENVPN_AUTH_USER = os.environ.get("OPENVPN_AUTH_USER", "vpn")
 OPENVPN_AUTH_PASS = os.environ.get("OPENVPN_AUTH_PASS", "vpn")
 LOCAL_PROXY_HOST = os.environ.get("LOCAL_PROXY_HOST", "127.0.0.1")
 LOCAL_PROXY_PORT = env_int("LOCAL_PROXY_PORT", 7928, 1, 65535)
+LOCAL_PROXY_REQUIRED_URL = os.environ.get("LOCAL_PROXY_REQUIRED_URL", "").strip()
 UI_HOST = os.environ.get("UI_HOST", "::")
 UI_PORT = env_int("UI_PORT", 8787, 1, 65535)
 INVALID_BACKOFF_SECONDS = env_int("INVALID_BACKOFF_SECONDS", 30 * 60, 1)
@@ -7669,18 +7670,17 @@ def check_proxy_health() -> dict[str, Any]:
             "error": "[错误代码 3004] [ERR_ROUTE_DEV_NOT_FOUND] VPN 虚拟网卡 (tun0) 未启用，请确保当前已成功连接 VPN 节点"
         }
 
+    if LOCAL_PROXY_HOST == "::":
+        proxy_hosts = ["[::1]", "127.0.0.1"]
+    elif LOCAL_PROXY_HOST == "0.0.0.0":
+        proxy_hosts = ["127.0.0.1"]
+    elif ":" in LOCAL_PROXY_HOST:
+        proxy_hosts = [f"[{LOCAL_PROXY_HOST}]", "127.0.0.1"]
+    else:
+        proxy_hosts = [LOCAL_PROXY_HOST]
+
     # 3. 使用 curl 通过本地 SOCKS5 代理接口测试 IP 与实际延迟
     def _curl_check_ip(url: str) -> dict[str, Any] | None:
-        proxy_hosts = []
-        if LOCAL_PROXY_HOST == "::":
-            proxy_hosts = ["[::1]", "127.0.0.1"]
-        elif LOCAL_PROXY_HOST == "0.0.0.0":
-            proxy_hosts = ["127.0.0.1"]
-        elif ":" in LOCAL_PROXY_HOST:
-            proxy_hosts = [f"[{LOCAL_PROXY_HOST}]", "127.0.0.1"]
-        else:
-            proxy_hosts = [LOCAL_PROXY_HOST]
-
         for p_host in proxy_hosts:
             proxy_url = f"socks5h://{p_host}:{LOCAL_PROXY_PORT}"
             proxy_user, proxy_pass = proxy_server.get_proxy_credentials()
@@ -7709,11 +7709,40 @@ def check_proxy_health() -> dict[str, Any]:
                 pass
         return None
 
+    def _curl_check_required_url(url: str) -> bool:
+        for p_host in proxy_hosts:
+            proxy_url = f"socks5h://{p_host}:{LOCAL_PROXY_PORT}"
+            proxy_user, proxy_pass = proxy_server.get_proxy_credentials()
+            cmd = [
+                "curl", "-sS", "-o", os.devnull,
+                "-w", "%{http_code}",
+                "-x", proxy_url,
+                url,
+                "--max-time", "8",
+            ]
+            if proxy_user is not None and proxy_pass is not None:
+                cmd.extend(["--proxy-user", f"{proxy_user}:{proxy_pass}"])
+            try:
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=9)
+                if res.returncode == 0:
+                    status = int(res.stdout.strip())
+                    if 200 <= status < 400:
+                        return True
+            except Exception:
+                pass
+        return False
+
     try:
         result = _curl_check_ip("http://ip.sb")
-        if result:
-            return result
-        result = _curl_check_ip("http://api.ipify.org")
+        if not result:
+            result = _curl_check_ip("http://api.ipify.org")
+        if result and LOCAL_PROXY_REQUIRED_URL:
+            if not _curl_check_required_url(LOCAL_PROXY_REQUIRED_URL):
+                return {
+                    "ok": False,
+                    "error_code": "client_probe_unreachable",
+                    "error": "[ERR_CLIENT_PROBE_UNREACHABLE] 客户端延迟检测目标无法通过当前 VPN 出口访问",
+                }
         if result:
             return result
             

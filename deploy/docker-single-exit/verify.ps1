@@ -29,11 +29,14 @@ do {
         $proxyAddress = $null
         $proxyValid = [Net.IPAddress]::TryParse($proxyExit, [ref]$proxyAddress)
 
+        $clientProbeCode = (& curl.exe --silent --show-error --max-time 20 --output NUL --write-out '%{http_code}' --socks5-hostname '127.0.0.1:17928' 'https://www.google.com/generate_204').Trim()
+        $clientProbeValid = $LASTEXITCODE -eq 0 -and $clientProbeCode -eq '204'
+
         $directExit = (& docker compose --project-name $script:PrototypeProjectName -f $script:PrototypeComposeFile exec -T aimilivpn-single curl --silent --show-error --fail --max-time 20 --interface eth0 'https://api.ipify.org').Trim()
         $directAddress = $null
         $directValid = [Net.IPAddress]::TryParse($directExit, [ref]$directAddress)
 
-        if ($proxyValid -and $directValid -and $proxyExit -ne $directExit) {
+        if ($proxyValid -and $clientProbeValid -and $directValid -and $proxyExit -ne $directExit) {
             $ready = $true
             break
         }
@@ -53,6 +56,7 @@ Assert-HostSafetyUnchanged -Before $before -After $after
     OpenVPNProcesses = 1
     Tun0 = $true
     ProxyEgressValid = $true
+    ClientDelayProbeValid = $true
     ProxyEgressDiffersFromContainerDirect = $true
     HostSafety = 'unchanged'
 } | ConvertTo-Json -Compress

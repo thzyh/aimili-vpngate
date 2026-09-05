@@ -158,6 +158,10 @@ class DockerComposeContractTests(unittest.TestCase):
         environment = service["environment"]
         self.assertEqual(environment["MULTI_EXIT_SLOTS"], "0")
         self.assertEqual(environment["LOCAL_PROXY_HOST"], "0.0.0.0")
+        self.assertEqual(
+            environment["LOCAL_PROXY_REQUIRED_URL"],
+            "https://www.google.com/generate_204",
+        )
         self.assertEqual(environment["UI_HOST"], "0.0.0.0")
         self.assertEqual(environment["AIMILI_CONTROL_ADDRESS"], "127.0.0.1:8790")
 
