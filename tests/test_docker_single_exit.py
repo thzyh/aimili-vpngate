@@ -14,6 +14,9 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 DOCKER_DIR = ROOT / "deploy" / "docker-single-exit"
 ENTRYPOINT = DOCKER_DIR / "entrypoint.py"
 COMPOSE_FILE = DOCKER_DIR / "compose.yaml"
+COMMON_SCRIPT = DOCKER_DIR / "common.ps1"
+START_SCRIPT = DOCKER_DIR / "start.ps1"
+STOP_SCRIPT = DOCKER_DIR / "stop.ps1"
 
 
 def load_entrypoint(test_case: unittest.TestCase):
@@ -155,6 +158,69 @@ class DockerComposeContractTests(unittest.TestCase):
         self.assertEqual(environment["LOCAL_PROXY_HOST"], "0.0.0.0")
         self.assertEqual(environment["UI_HOST"], "0.0.0.0")
         self.assertEqual(environment["AIMILI_CONTROL_ADDRESS"], "127.0.0.1:8790")
+
+
+class DockerScriptContractTests(unittest.TestCase):
+    def run_powershell(self, arguments, *, check=True):
+        completed = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                *arguments,
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        if check:
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+        return completed
+
+    def host_guard_snapshot(self):
+        command = (
+            "$ErrorActionPreference='Stop';"
+            f". '{COMMON_SCRIPT}';"
+            "Get-HostSafetySnapshot | ConvertTo-Json -Compress"
+        )
+        completed = self.run_powershell(["-Command", command])
+        return json.loads(completed.stdout)
+
+    def test_common_script_reports_the_fixed_local_boundary(self):
+        self.assertTrue(COMMON_SCRIPT.is_file(), "common PowerShell module is missing")
+        command = f". '{COMMON_SCRIPT}'; Get-PrototypeDefinition | ConvertTo-Json -Compress"
+        completed = self.run_powershell(["-Command", command])
+        definition = json.loads(completed.stdout)
+        self.assertEqual(definition["ProjectName"], "aimili-single-exit")
+        self.assertEqual(definition["ProxyEndpoint"], "127.0.0.1:17928")
+        self.assertEqual(definition["UIEndpoint"], "127.0.0.1:18787")
+        self.assertEqual(pathlib.Path(definition["ComposeFile"]).resolve(), COMPOSE_FILE.resolve())
+
+    def test_start_check_only_preserves_host_proxy_routes_and_v2rayn(self):
+        self.assertTrue(START_SCRIPT.is_file(), "start PowerShell script is missing")
+        before = self.host_guard_snapshot()
+        completed = self.run_powershell(["-File", str(START_SCRIPT), "-CheckOnly"])
+        after = self.host_guard_snapshot()
+
+        self.assertIn("preflight=passed", completed.stdout)
+        self.assertEqual(after["V2rayNPids"], before["V2rayNPids"])
+        self.assertEqual(after["ProxyEnable"], before["ProxyEnable"])
+        self.assertEqual(after["ProxyServer"], before["ProxyServer"])
+        self.assertEqual(after["DefaultRouteDigest"], before["DefaultRouteDigest"])
+
+    def test_stop_plan_requires_explicit_purge_and_has_no_side_effect(self):
+        self.assertTrue(STOP_SCRIPT.is_file(), "stop PowerShell script is missing")
+        before = self.host_guard_snapshot()
+        keep = self.run_powershell(["-File", str(STOP_SCRIPT), "-Plan"])
+        purge = self.run_powershell(["-File", str(STOP_SCRIPT), "-Plan", "-PurgeData"])
+        after = self.host_guard_snapshot()
+
+        self.assertEqual(json.loads(keep.stdout)["PurgeData"], False)
+        self.assertEqual(json.loads(purge.stdout)["PurgeData"], True)
+        self.assertEqual(after, before)
 
 
 if __name__ == "__main__":
