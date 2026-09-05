@@ -93,10 +93,27 @@ function Assert-HostSafetyUnchanged {
 function Assert-PrototypePortsFree {
     foreach ($port in @(17928, 18787)) {
         $listeners = @(Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue)
-        if ($listeners.Count -ne 0) {
+        if ($listeners.Count -ne 0 -and -not (Test-PrototypeOwnsPort -PublishedPort $port)) {
             throw "local prototype port $port is already in use"
         }
     }
+}
+
+function Test-PrototypeOwnsPort {
+    param([Parameter(Mandatory)][int]$PublishedPort)
+    if (-not (Test-DockerEngineAvailable)) {
+        return $false
+    }
+    $containerId = (& docker compose --project-name $script:PrototypeProjectName -f $script:PrototypeComposeFile ps -q aimilivpn-single 2>$null).Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $containerId) {
+        return $false
+    }
+    $targetPort = if ($PublishedPort -eq 17928) { 7928 } elseif ($PublishedPort -eq 18787) { 8787 } else { return $false }
+    $bindings = @(& docker port $containerId "$targetPort/tcp" 2>$null)
+    if ($LASTEXITCODE -ne 0) {
+        return $false
+    }
+    return @($bindings | Where-Object { $_.Trim() -eq "127.0.0.1:$PublishedPort" }).Count -eq 1
 }
 
 function Invoke-PrototypeCompose {
@@ -110,6 +127,29 @@ function Invoke-PrototypeCompose {
 function Test-DockerEngineAvailable {
     & cmd.exe /d /s /c 'docker info --format "{{.ServerVersion}}" >nul 2>nul'
     return $LASTEXITCODE -eq 0
+}
+
+function Get-PrototypeRuntimeState {
+    $containerId = (& docker compose --project-name $script:PrototypeProjectName -f $script:PrototypeComposeFile ps -q aimilivpn-single).Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $containerId) {
+        throw 'single-exit container is not running'
+    }
+    $health = (& docker inspect --format '{{.State.Health.Status}}' $containerId).Trim()
+    if ($LASTEXITCODE -ne 0) {
+        throw 'unable to inspect single-exit container health'
+    }
+    $probe = "import json,pathlib,subprocess; result=subprocess.run(['pgrep','-xc','openvpn'],capture_output=True,text=True); print(json.dumps({'tun0':pathlib.Path('/sys/class/net/tun0').is_dir(),'openvpn':int((result.stdout.strip() or '0'))}))"
+    $raw = & docker compose --project-name $script:PrototypeProjectName -f $script:PrototypeComposeFile exec -T aimilivpn-single python3 -c $probe
+    if ($LASTEXITCODE -ne 0) {
+        throw 'unable to inspect single-exit runtime state'
+    }
+    $runtime = $raw | ConvertFrom-Json
+    [pscustomobject]@{
+        ContainerRunning = $true
+        Health = $health
+        Tun0 = [bool]$runtime.tun0
+        OpenVPNProcesses = [int]$runtime.openvpn
+    }
 }
 
 function Ensure-DockerEngine {

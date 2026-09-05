@@ -19,6 +19,6 @@ if ($LASTEXITCODE -ne 0) {
     throw 'unable to read local prototype access details'
 }
 $access = $raw | ConvertFrom-Json
-Write-Output ("管理页：{0}" -f $access.url)
-Write-Output ("用户名：{0}" -f $access.username)
-Write-Output ("密码：{0}" -f $access.password)
+Write-Output ("URL: {0}" -f $access.url)
+Write-Output ("Username: {0}" -f $access.username)
+Write-Output ("Password: {0}" -f $access.password)

@@ -1,11 +1,17 @@
 [CmdletBinding()]
 param(
     [ValidateRange(60, 1800)]
-    [int]$TimeoutSeconds = 900
+    [int]$TimeoutSeconds = 900,
+    [switch]$RuntimeProbeOnly
 )
 
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'common.ps1')
+
+if ($RuntimeProbeOnly) {
+    Get-PrototypeRuntimeState | ConvertTo-Json -Compress
+    exit 0
+}
 
 if (-not (Test-Path -LiteralPath $script:PrototypeBaselineFile -PathType Leaf)) {
     throw 'host safety baseline is missing; run start.ps1 first'
@@ -15,17 +21,8 @@ $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
 $ready = $false
 
 do {
-    $containerId = (& docker compose --project-name $script:PrototypeProjectName -f $script:PrototypeComposeFile ps -q aimilivpn-single).Trim()
-    if ($LASTEXITCODE -ne 0 -or -not $containerId) {
-        throw 'single-exit container is not running'
-    }
-
-    $health = (& docker inspect --format '{{.State.Health.Status}}' $containerId).Trim()
-    $runtimeReady = $false
-    if ($health -eq 'healthy') {
-        & docker compose --project-name $script:PrototypeProjectName -f $script:PrototypeComposeFile exec -T aimilivpn-single sh -ec 'test -d /sys/class/net/tun0; test "$(pgrep -x openvpn | wc -l)" -eq 1' *> $null
-        $runtimeReady = $LASTEXITCODE -eq 0
-    }
+    $runtime = Get-PrototypeRuntimeState
+    $runtimeReady = $runtime.Health -eq 'healthy' -and $runtime.Tun0 -and $runtime.OpenVPNProcesses -eq 1
 
     if ($runtimeReady) {
         $proxyExit = (& curl.exe --silent --show-error --fail --max-time 20 --proxy 'http://127.0.0.1:17928' 'https://api.ipify.org').Trim()

@@ -17,6 +17,8 @@ COMPOSE_FILE = DOCKER_DIR / "compose.yaml"
 COMMON_SCRIPT = DOCKER_DIR / "common.ps1"
 START_SCRIPT = DOCKER_DIR / "start.ps1"
 STOP_SCRIPT = DOCKER_DIR / "stop.ps1"
+VERIFY_SCRIPT = DOCKER_DIR / "verify.ps1"
+SHOW_ACCESS_SCRIPT = DOCKER_DIR / "show-access.ps1"
 
 
 def load_entrypoint(test_case: unittest.TestCase):
@@ -244,6 +246,60 @@ class DockerScriptContractTests(unittest.TestCase):
         self.assertEqual(json.loads(keep.stdout)["PurgeData"], False)
         self.assertEqual(json.loads(purge.stdout)["PurgeData"], True)
         self.assertEqual(after, before)
+
+
+@unittest.skipUnless(
+    os.environ.get("AIMILI_DOCKER_INTEGRATION") == "1",
+    "local Docker integration is opt-in",
+)
+class DockerRunningIntegrationTests(unittest.TestCase):
+    def test_runtime_probe_returns_only_sanitized_process_and_tun_state(self):
+        completed = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(VERIFY_SCRIPT),
+                "-RuntimeProbeOnly",
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        state = json.loads(completed.stdout)
+        self.assertEqual(set(state), {"ContainerRunning", "Health", "Tun0", "OpenVPNProcesses"})
+        self.assertTrue(state["ContainerRunning"])
+        self.assertIn(state["Health"], {"starting", "healthy", "unhealthy"})
+        self.assertIsInstance(state["Tun0"], bool)
+        self.assertGreaterEqual(state["OpenVPNProcesses"], 0)
+
+    def test_show_access_completes_without_echoing_secrets_on_failure(self):
+        completed = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(SHOW_ACCESS_SCRIPT),
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        lines = completed.stdout.splitlines()
+        self.assertEqual(len(lines), 3)
+        self.assertTrue(lines[0].startswith("URL: "))
+        self.assertTrue(lines[1].startswith("Username: "))
+        self.assertTrue(lines[2].startswith("Password: "))
 
 
 if __name__ == "__main__":
