@@ -18,6 +18,12 @@ Bilingual: [中文](#中文) | [English](#english)
 <a name="中文"></a>
 ## 中文
 
+### 本机 Docker 单出口隔离原型
+
+Windows Docker Desktop 的第一阶段数据面原型位于 [`deploy/docker-single-exit`](./deploy/docker-single-exit/README.md)。它在独立 Linux 网络命名空间中建立一条真实 OpenVPN 出口，只向 Windows 回环发布 `127.0.0.1:17928` 代理和 `127.0.0.1:18787` 管理页，不修改系统代理、默认路由或 v2rayN。
+
+该原型不包含 Gateway、3x-ui/Xray 和四出口事务；用途是先验证本机 Docker 的真实 TUN、拨号、代理和宿主隔离边界。启动、脱敏自动验证、用户手动验收及可恢复停止方法见上述专用文档。
+
 **AimiliVPN 多出口增强版** 是一个基于官方 VPNGate 开放协议的、**零第三方依赖（纯 Python 标准库）** 的高性能 VPN 代理网关。在上游能力（智能并发测速、多路由模式、暗黑玻璃拟物管理网页、实时日志、故障自愈）之上，本二开版本新增并强化了以下能力：
 
 - 🌟 **多出口住宅 IP（Multi-Exit）**：单台服务器上同时维持 **N 条相互隔离的隧道**，每条连接不同住宅节点、绑定独立本地代理端口，**专为配合 3x-ui / Xray 实现「每个入站走一个独立住宅 IP」**，并可一键导出 Xray 出站配置。
