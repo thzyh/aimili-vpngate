@@ -5,16 +5,6 @@ $script:PrototypeProjectName = 'aimili-single-exit'
 $script:PrototypeStateDirectory = Join-Path $env:LOCALAPPDATA 'AimiliGateway\docker-single-exit'
 $script:PrototypeBaselineFile = Join-Path $script:PrototypeStateDirectory 'host-baseline.json'
 
-function Get-PrototypeDefinition {
-    [pscustomobject]@{
-        ProjectName = $script:PrototypeProjectName
-        ComposeFile = [IO.Path]::GetFullPath($script:PrototypeComposeFile)
-        ProxyEndpoint = '127.0.0.1:17928'
-        UIEndpoint = '127.0.0.1:18787'
-        BaselineFile = $script:PrototypeBaselineFile
-    }
-}
-
 function Get-DefaultRouteDigest {
     $routes = @(Get-NetRoute -ErrorAction Stop | Where-Object {
         $_.DestinationPrefix -in @('0.0.0.0/0', '::/0')

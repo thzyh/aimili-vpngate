@@ -214,16 +214,6 @@ class DockerScriptContractTests(unittest.TestCase):
         completed = self.run_powershell(["-Command", command])
         return json.loads(completed.stdout)
 
-    def test_common_script_reports_the_fixed_local_boundary(self):
-        self.assertTrue(COMMON_SCRIPT.is_file(), "common PowerShell module is missing")
-        command = f". '{COMMON_SCRIPT}'; Get-PrototypeDefinition | ConvertTo-Json -Compress"
-        completed = self.run_powershell(["-Command", command])
-        definition = json.loads(completed.stdout)
-        self.assertEqual(definition["ProjectName"], "aimili-single-exit")
-        self.assertEqual(definition["ProxyEndpoint"], "127.0.0.1:17928")
-        self.assertEqual(definition["UIEndpoint"], "127.0.0.1:18787")
-        self.assertEqual(pathlib.Path(definition["ComposeFile"]).resolve(), COMPOSE_FILE.resolve())
-
     def test_start_check_only_preserves_host_proxy_routes_and_v2rayn(self):
         self.assertTrue(START_SCRIPT.is_file(), "start PowerShell script is missing")
         before = self.host_guard_snapshot()
