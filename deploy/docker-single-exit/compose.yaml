@@ -1,0 +1,80 @@
+name: aimili-single-exit
+
+services:
+  aimilivpn-single:
+    image: aimili-vpngate:single-exit-local
+    build:
+      context: ../..
+      dockerfile: deploy/docker-single-exit/Dockerfile
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun:rwm
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      VPNGATE_DATA_DIR: /var/lib/aimilivpn
+      LOCAL_PROXY_HOST: 0.0.0.0
+      LOCAL_PROXY_PORT: "7928"
+      UI_HOST: 0.0.0.0
+      UI_PORT: "8787"
+      AIMILI_CONTROL_ADDRESS: 127.0.0.1:8790
+      AIMILI_CONTROL_TOKEN_FILE: /var/lib/aimilivpn/control.token
+      MULTI_EXIT_SLOTS: "0"
+      MAX_EXIT_SLOTS: "1"
+      TARGET_VALID_POOL_SIZE: "3"
+      MAX_FETCH_ROWS: "60"
+      NODE_TEST_BATCH_SIZE: "3"
+      OPENVPN_TEST_CONCURRENCY: "1"
+      TCP_PRESCREEN_CONCURRENCY: "20"
+    ports:
+      - target: 7928
+        published: "17928"
+        host_ip: 127.0.0.1
+        protocol: tcp
+      - target: 8787
+        published: "18787"
+        host_ip: 127.0.0.1
+        protocol: tcp
+    volumes:
+      - type: volume
+        source: single-exit-data
+        target: /var/lib/aimilivpn
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=67108864
+      - /run:rw,nosuid,nodev,size=16777216
+    networks:
+      - single-exit-net
+    pids_limit: 256
+    mem_limit: 536870912
+    cpus: 1.0
+    stop_grace_period: 20s
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import socket; [socket.create_connection(('127.0.0.1', p), 2).close() for p in (7928, 8787)]"
+      interval: 10s
+      timeout: 5s
+      retries: 90
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+volumes:
+  single-exit-data:
+    name: aimili-single-exit-data
+
+networks:
+  single-exit-net:
+    name: aimili-single-exit-net
+    driver: bridge
