@@ -2728,6 +2728,18 @@ def reset_main_proxy_connections() -> None:
     except Exception as e:
         print(f"[主代理] 重置下游连接异常: {e}", flush=True)
 
+
+def _recover_main_after_pool_exhaustion() -> None:
+    """Wait for the current switch mutation to finish, then refill and reconnect."""
+    try:
+        with mutation_lock:
+            result = maintain_valid_nodes(force=False)
+        if result == "operation_busy":
+            print("[自动切换后台补齐] 主连接事务仍在进行，本轮恢复已安全延后", flush=True)
+    except Exception as e:
+        print(f"[自动切换后台补齐] 获取并测试节点失败: {e}", flush=True)
+
+
 @_mutation_guard(None)
 def auto_switch_node(attempt: int = 0) -> None:
     if not main_mutation_allowed():
@@ -2824,14 +2836,7 @@ def auto_switch_node(attempt: int = 0) -> None:
             write_json(NODES_FILE, sort_all_nodes(nodes))
         set_state(active_openvpn_node_id="", last_check_message=msg)
         
-        def bg_fetch_and_switch():
-            try:
-                maintain_valid_nodes(force=False)
-                auto_switch_node()
-            except Exception as e:
-                print(f"[自动切换后台补齐] 获取并测试节点失败: {e}", flush=True)
-        
-        threading.Thread(target=bg_fetch_and_switch, daemon=True).start()
+        threading.Thread(target=_recover_main_after_pool_exhaustion, daemon=True).start()
 
 @_mutation_guard(raise_busy=True)
 def connect_node(node_id: str) -> str:

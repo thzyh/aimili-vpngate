@@ -1,5 +1,6 @@
 import base64
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -30,6 +31,61 @@ def country_node(node_id, country, status="not_checked"):
 
 
 class PoolMaintenanceTests(unittest.TestCase):
+    def test_pool_exhaustion_recovery_waits_for_current_mutation_to_finish(self):
+        original_thread = threading.Thread
+        worker_entered = threading.Event()
+        maintenance_started = threading.Event()
+        workers = []
+        maintenance_calls = []
+
+        @manager._mutation_guard("operation_busy")
+        def guarded_maintenance(force=False):
+            maintenance_calls.append(force)
+            maintenance_started.set()
+            return "recovered"
+
+        class CoordinatedThread:
+            def __init__(self, *, target, args=(), kwargs=None, daemon=None):
+                def run():
+                    worker_entered.set()
+                    target(*args, **(kwargs or {}))
+
+                self.worker = original_thread(target=run, daemon=daemon)
+                workers.append(self.worker)
+
+            def start(self):
+                self.worker.start()
+                if not worker_entered.wait(1):
+                    raise AssertionError("recovery worker did not start")
+
+        original_active_id = manager.active_openvpn_node_id
+        manager.active_openvpn_node_id = ""
+        try:
+            with (
+                mock.patch.object(
+                    manager,
+                    "load_ui_config",
+                    return_value={"connection_enabled": True, "routing_mode": "auto"},
+                ),
+                mock.patch.object(manager, "read_nodes", return_value=[]),
+                mock.patch.object(manager, "stop_active_openvpn"),
+                mock.patch.object(manager, "write_json"),
+                mock.patch.object(manager, "set_state"),
+                mock.patch.object(manager, "log_to_json"),
+                mock.patch.object(manager, "maintain_valid_nodes", guarded_maintenance),
+                mock.patch.object(manager.threading, "Thread", CoordinatedThread),
+            ):
+                manager.auto_switch_node()
+                self.assertTrue(
+                    maintenance_started.wait(1),
+                    "pool recovery was lost while auto_switch_node still held the mutation lock",
+                )
+                self.assertEqual(maintenance_calls, [False])
+        finally:
+            manager.active_openvpn_node_id = original_active_id
+            for worker in workers:
+                worker.join(timeout=1)
+
     def test_corrupt_pool_metadata_returns_safe_defaults_without_touching_nodes(self):
         with tempfile.TemporaryDirectory() as directory:
             metadata = Path(directory) / "pool_metadata.json"
