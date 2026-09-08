@@ -113,7 +113,7 @@ FETCH_INTERVAL_SECONDS = env_int("FETCH_INTERVAL_SECONDS", 1260, 1)
 CHECK_INTERVAL_SECONDS = env_int("CHECK_INTERVAL_SECONDS", 1260, 1)
 _legacy_max_scan_rows = env_int("MAX_SCAN_ROWS", 300, 1)
 MAX_FETCH_ROWS = env_int("MAX_FETCH_ROWS", _legacy_max_scan_rows, 1)
-_legacy_target_valid_nodes = env_int("TARGET_VALID_NODES", 30, 1)
+_legacy_target_valid_nodes = env_int("TARGET_VALID_NODES", 40, 1)
 TARGET_VALID_POOL_SIZE = env_int("TARGET_VALID_POOL_SIZE", _legacy_target_valid_nodes, 1)
 TARGET_VALID_NODES = TARGET_VALID_POOL_SIZE
 NODE_TEST_BATCH_SIZE = env_int("NODE_TEST_BATCH_SIZE", 10, 1)
@@ -2353,8 +2353,25 @@ exit_slots: dict[int, dict[str, Any]] = {}
 exit_slot_proxy_stops: dict[int, threading.Event] = {}
 slot_bad_nodes: dict[str, float] = {}          # node_id -> 冷却到期时间(出口不通的坏节点，暂时排除)
 slot_egress_fail_counts: dict[int, int] = {}   # slot_index -> 连续出口失败次数
+slot_reconnect_hints: dict[int, str] = {}      # 进程重启后优先恢复上次槽位节点；每槽仅消费一次
 last_exit_slots_heartbeat = 0.0
 last_slot_egress_heartbeat = 0.0
+
+def load_slot_reconnect_hints() -> dict[int, str]:
+    try:
+        document = json.loads(SLOTS_FILE.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    rows = document.get("slots", []) if isinstance(document, dict) else []
+    hints: dict[int, str] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        slot = parse_int(row.get("slot"))
+        node_id = str(row.get("node_id") or "").strip()
+        if 0 <= slot < MAX_EXIT_SLOTS and node_id and len(node_id) <= 256:
+            hints[slot] = node_id
+    return hints
 
 def kill_slot_openvpn_processes() -> None:
     """清理上一轮遗留的槽位 OpenVPN 孤儿进程（带 AIMILI_SLOT 标记）。
@@ -2697,10 +2714,16 @@ def pick_slot_node(i: int, used_ids: set[str]) -> dict[str, Any] | None:
             return node
     cfg = get_exit_slot_config()
     proxy_type = per_slot_type(i)
+    reconnect_hint = slot_reconnect_hints.pop(i, "")
     picks = select_slot_nodes(
-        used_ids, 1, per_slot_country(i), cfg["residential_only"] and not proxy_type,
+        used_ids, MAX_EXIT_SLOTS * 1024 if reconnect_hint else 1,
+        per_slot_country(i), cfg["residential_only"] and not proxy_type,
         per_slot_isp(i), proxy_type,
     )
+    if reconnect_hint:
+        previous = next((node for node in picks if node.get("id") == reconnect_hint), None)
+        if previous:
+            return previous
     return picks[0] if picks else None
 
 def select_slot_nodes(
@@ -2912,6 +2935,9 @@ def supervise_exit_slots_once() -> None:
             node = pick_slot_node(i, used)
             if node:
                 if not bring_up_slot(i, node):
+                    failed_node_id = str(node.get("id") or "")
+                    if failed_node_id:
+                        slot_bad_nodes[failed_node_id] = time.time() + SLOT_BAD_NODE_COOLDOWN
                     mark_slot_pending(i, f"节点 {node.get('id')} 连接失败，待重试")
             else:
                 scope = per_slot_country(i) or "不限地区"
@@ -7511,6 +7537,8 @@ def start_control_plane() -> control_api.ControlHTTPServer:
 
 def main() -> None:
     ensure_dirs()
+    slot_reconnect_hints.clear()
+    slot_reconnect_hints.update(load_slot_reconnect_hints())
     kill_existing_openvpn_processes()
     kill_slot_openvpn_processes()
     

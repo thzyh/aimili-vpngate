@@ -116,6 +116,42 @@ class ExitSlotTypeTests(unittest.TestCase):
 
         self.assertEqual(selected["id"], "jp-dc")
 
+    def test_pick_slot_node_prefers_saved_reconnect_hint(self):
+        nodes = [
+            {"id": "fast-new", "country_short": "JP", "ip_type": "hosting", "probe_status": "available", "latency_ms": 1, "score": 9},
+            {"id": "saved-node", "country_short": "JP", "ip_type": "hosting", "probe_status": "available", "latency_ms": 20, "score": 2},
+        ]
+        with (
+            mock.patch.object(manager, "slot_reconnect_hints", {0: "saved-node"}),
+            mock.patch.object(manager, "get_slot_pin_map", return_value={}),
+            mock.patch.object(manager, "get_exit_slot_config", return_value={"residential_only": False}),
+            mock.patch.object(manager, "per_slot_country", return_value="JP"),
+            mock.patch.object(manager, "per_slot_isp", return_value=""),
+            mock.patch.object(manager, "per_slot_type", return_value="datacenter"),
+            mock.patch.object(manager, "read_nodes", return_value=nodes),
+        ):
+            selected = manager.pick_slot_node(0, set())
+
+        self.assertEqual(selected["id"], "saved-node")
+
+    def test_pick_slot_node_ignores_unavailable_reconnect_hint(self):
+        nodes = [
+            {"id": "fast-new", "country_short": "JP", "ip_type": "hosting", "probe_status": "available", "latency_ms": 1, "score": 9},
+            {"id": "saved-node", "country_short": "JP", "ip_type": "hosting", "probe_status": "unavailable", "latency_ms": 20, "score": 2},
+        ]
+        with (
+            mock.patch.object(manager, "slot_reconnect_hints", {0: "saved-node"}),
+            mock.patch.object(manager, "get_slot_pin_map", return_value={}),
+            mock.patch.object(manager, "get_exit_slot_config", return_value={"residential_only": False}),
+            mock.patch.object(manager, "per_slot_country", return_value="JP"),
+            mock.patch.object(manager, "per_slot_isp", return_value=""),
+            mock.patch.object(manager, "per_slot_type", return_value="datacenter"),
+            mock.patch.object(manager, "read_nodes", return_value=nodes),
+        ):
+            selected = manager.pick_slot_node(0, set())
+
+        self.assertEqual(selected["id"], "fast-new")
+
     def test_failed_rotate_candidate_enters_cooldown(self):
         candidate = {
             "id": "jp-stale",
@@ -146,6 +182,29 @@ class ExitSlotTypeTests(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertIn("jp-stale", bad_nodes)
+
+    def test_supervisor_failed_dial_candidate_enters_cooldown(self):
+        candidate = {"id": "stale-fastest", "probe_status": "available"}
+        bad_nodes = {}
+        with (
+            mock.patch.object(manager, "exit_slots_supervise_lock", threading.Lock()),
+            mock.patch.object(manager, "get_active_slots", return_value=[0]),
+            mock.patch.object(manager, "get_paused_slots", return_value=set()),
+            mock.patch.object(manager, "exit_slots", {}),
+            mock.patch.object(manager, "exit_slot_proxy_stops", {}),
+            mock.patch.object(manager, "slot_process_alive", return_value=False),
+            mock.patch.object(manager, "tear_down_slot"),
+            mock.patch.object(manager, "current_slot_node_ids", return_value=set()),
+            mock.patch.object(manager, "pick_slot_node", return_value=candidate),
+            mock.patch.object(manager, "bring_up_slot", return_value=False),
+            mock.patch.object(manager, "mark_slot_pending"),
+            mock.patch.object(manager, "write_slots_state"),
+            mock.patch.object(manager, "slot_bad_nodes", bad_nodes),
+        ):
+            manager.supervise_exit_slots_once()
+
+        self.assertIn("stale-fastest", bad_nodes)
+        self.assertGreater(bad_nodes["stale-fastest"], time.time())
 
 
 class ManagedSlotFacadeTests(unittest.TestCase):
