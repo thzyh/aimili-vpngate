@@ -36,6 +36,48 @@ class ExitSlotTypeTests(unittest.TestCase):
             "candidate_dial_failed",
         )
 
+    def test_connection_reset_is_a_persistable_candidate_dial_failure(self):
+        for reset_marker in (
+            "Connection reset, restarting [0]",
+            "SIGUSR1[soft,connection-reset] received",
+        ):
+            with self.subTest(reset_marker=reset_marker):
+                code, message = manager.vpn_utils.diagnose_openvpn_failure([
+                    reset_marker,
+                    "Exiting due to fatal error",
+                ])
+
+                self.assertEqual(code, 2004)
+                self.assertIn("ERR_OVPN_NODE_UNREACHABLE", message)
+                self.assertEqual(
+                    manager._candidate_dial_failure_code(message),
+                    "candidate_dial_failed",
+                )
+
+    def test_local_permission_or_option_errors_override_connection_reset(self):
+        cases = (
+            (
+                "permission",
+                "permission denied while opening TUN device",
+                "ERR_OVPN_PERMISSION_DENIED",
+            ),
+            (
+                "options",
+                "Options error: --route-nopull is incompatible",
+                "ERR_OVPN_ROUTE_NOPULL",
+            ),
+        )
+        for name, local_error, expected_marker in cases:
+            with self.subTest(name=name):
+                _code, message = manager.vpn_utils.diagnose_openvpn_failure([
+                    local_error,
+                    "SIGUSR1[soft,connection-reset] received",
+                    "Exiting due to fatal error",
+                ])
+
+                self.assertIn(expected_marker, message)
+                self.assertEqual(manager._candidate_dial_failure_code(message), "")
+
     def test_mark_candidate_unavailable_persists_blacklist_and_pool_state(self):
         candidate = {
             "id": "jp-stale",
@@ -240,6 +282,81 @@ class ExitSlotTypeTests(unittest.TestCase):
                     manager.connect_node("jp-refused")
 
         mark.assert_called_once_with("jp-refused", "candidate_dial_failed")
+
+    def test_connection_reset_rejects_candidate_before_auto_switch_selects_standby(self):
+        reset_candidate = {
+            "id": "jp-reset",
+            "country_short": "JP",
+            "country": "Japan",
+            "ip": "198.51.100.34",
+            "ip_type": "hosting",
+            "latency_ms": 1,
+            "score": 2,
+            "probe_status": "available",
+            "config_text": "client",
+        }
+        standby_candidate = {
+            "id": "jp-standby",
+            "country_short": "JP",
+            "country": "Japan",
+            "ip": "198.51.100.35",
+            "ip_type": "hosting",
+            "latency_ms": 2,
+            "score": 1,
+            "probe_status": "available",
+            "config_text": "client",
+        }
+        _code, reset_message = manager.vpn_utils.diagnose_openvpn_failure([
+            "Connection reset, restarting [0]",
+            "Exiting due to fatal error",
+        ])
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory) / "data"
+            config_dir = Path(directory) / "configs"
+            nodes_file = data_dir / "nodes.json"
+            blacklist_file = data_dir / "blacklist.json"
+            data_dir.mkdir()
+            reset_candidate["config_file"] = str(config_dir / "reset.ovpn")
+            nodes_file.write_text(
+                json.dumps([reset_candidate, standby_candidate]), encoding="utf-8"
+            )
+            blacklist_file.write_text("{}", encoding="utf-8")
+            settings = {"connection_enabled": True, "routing_mode": "auto", "routing_ip_type": "all"}
+            with (
+                mock.patch.object(manager, "DATA_DIR", data_dir),
+                mock.patch.object(manager, "CONFIG_DIR", config_dir),
+                mock.patch.object(manager, "NODES_FILE", nodes_file),
+                mock.patch.object(manager, "BLACKLIST_FILE", blacklist_file),
+                mock.patch.object(manager, "is_connecting", False),
+                mock.patch.object(manager, "active_openvpn_node_id", ""),
+                mock.patch.object(manager, "main_mutation_allowed", return_value=True),
+                mock.patch.object(manager, "reserved_slot_candidate_ids", return_value=set()),
+                mock.patch.object(manager, "load_ui_config", return_value=settings),
+                mock.patch.object(manager, "set_state"),
+                mock.patch.object(manager, "log_to_json"),
+                mock.patch.object(manager, "stop_active_openvpn"),
+                mock.patch.object(
+                    manager,
+                    "mark_candidate_unavailable",
+                    wraps=manager.mark_candidate_unavailable,
+                ) as mark,
+                mock.patch.object(
+                    manager,
+                    "run_openvpn_until_ready",
+                    return_value=(False, reset_message, None),
+                ),
+            ):
+                with self.assertRaises(manager.CandidateUnavailableError):
+                    manager.connect_node("jp-reset")
+                persisted = json.loads(nodes_file.read_text(encoding="utf-8"))
+                blacklist = json.loads(blacklist_file.read_text(encoding="utf-8"))
+                with mock.patch.object(manager, "connect_node") as connect:
+                    manager.auto_switch_node()
+
+        mark.assert_called_once_with("jp-reset", "candidate_dial_failed")
+        self.assertEqual(blacklist["jp-reset"]["reason_code"], "candidate_dial_failed")
+        self.assertEqual([node["id"] for node in persisted], ["jp-standby"])
+        connect.assert_called_once_with("jp-standby")
 
     def test_normalize_proxy_type_maps_only_supported_categories(self):
         cases = {
