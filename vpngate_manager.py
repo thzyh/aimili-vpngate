@@ -119,6 +119,7 @@ TARGET_VALID_NODES = TARGET_VALID_POOL_SIZE
 NODE_TEST_BATCH_SIZE = env_int("NODE_TEST_BATCH_SIZE", 10, 1)
 PROBE_FAILURE_COOLDOWN_SECONDS = env_int("PROBE_FAILURE_COOLDOWN_SECONDS", 1800, 1)
 OPENVPN_TEST_TIMEOUT_SECONDS = env_int("OPENVPN_TEST_TIMEOUT_SECONDS", 35, 1)
+OPENVPN_CONNECT_RETRY_MAX = env_int("OPENVPN_CONNECT_RETRY_MAX", 3, 1, 10)
 OPENVPN_TEST_CONCURRENCY = env_int("OPENVPN_TEST_CONCURRENCY", 8, 1, 64)
 TCP_PRESCREEN_CONCURRENCY = env_int("TCP_PRESCREEN_CONCURRENCY", 100, 1, 512)
 COLLECTOR_INITIAL_DELAY_SECONDS = env_int("COLLECTOR_INITIAL_DELAY_SECONDS", 0, 0)
@@ -1066,7 +1067,7 @@ def openvpn_command(config_file: str, route_nopull: bool, dev: str = "tun0", ext
             "--route-delay",
             "2",
             "--connect-retry-max",
-            "1",
+            str(OPENVPN_CONNECT_RETRY_MAX),
             "--connect-timeout",
             "15",
             "--auth-user-pass",

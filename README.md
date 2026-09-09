@@ -186,6 +186,7 @@ bash scripts/selfcheck_multiexit.sh
 | `MAX_FETCH_ROWS` | `300` | 单次 API 快照最多读取的唯一候选数 |
 | `NODE_TEST_BATCH_SIZE` | `10` | 每批送入 OpenVPN 精验的候选数 |
 | `PROBE_FAILURE_COOLDOWN_SECONDS` | `1800` | 失败节点重新允许测试前的冷却秒数 |
+| `OPENVPN_CONNECT_RETRY_MAX` | `3` | 单条 OpenVPN 在短暂宿主/物理链路抖动后的最大重连次数 |
 | `OPENVPN_TEST_CONCURRENCY` | `8` | OpenVPN 精验并发数 |
 | `TCP_PRESCREEN_CONCURRENCY` | `100` | TCP 粗筛并发数 |
 | `MAX_EXIT_SLOTS` | `16` | 多出口槽位上限 |

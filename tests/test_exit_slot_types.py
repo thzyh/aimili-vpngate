@@ -7,6 +7,18 @@ import vpngate_manager as manager
 
 
 class ExitSlotTypeTests(unittest.TestCase):
+    def test_openvpn_command_tolerates_short_host_link_flaps(self):
+        with (
+            mock.patch.object(manager, "OPENVPN_CONNECT_RETRY_MAX", 3),
+            mock.patch.object(manager, "get_openvpn_version", return_value=2.6),
+            mock.patch.object(manager.os.path, "exists", return_value=False),
+        ):
+            command = manager.openvpn_command("candidate.ovpn", route_nopull=True)
+
+        retry_index = command.index("--connect-retry-max")
+        self.assertEqual(command[retry_index + 1], "3")
+        self.assertIn("--route-nopull", command)
+
     def test_ensure_policy_routing_repairs_only_when_missing(self):
         with (
             mock.patch.object(manager, "policy_routing_ready", side_effect=[True, False, True]) as ready,
