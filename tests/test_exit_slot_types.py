@@ -249,6 +249,25 @@ class ExitSlotTypeTests(unittest.TestCase):
         self.assertIn("stale-fastest", bad_nodes)
         self.assertGreater(bad_nodes["stale-fastest"], time.time())
 
+    def test_slot_reconnect_closes_existing_downstream_connections(self):
+        registry = mock.Mock()
+        registry.close_all.return_value = 2
+        path = mock.Mock()
+        path.exists.return_value = False
+        registries = {2: registry}
+        with (
+            mock.patch.object(manager, "exit_slots", {2: {"process": object()}}),
+            mock.patch.object(manager, "exit_slot_proxy_stops", {2: threading.Event()}),
+            mock.patch.object(manager, "exit_slot_proxy_registries", registries),
+            mock.patch.object(manager, "stop_process"),
+            mock.patch.object(manager, "cleanup_policy_routing"),
+            mock.patch.object(manager, "slot_config_path", return_value=path),
+        ):
+            manager.tear_down_slot(2, stop_proxy=False)
+
+        registry.close_all.assert_called_once_with()
+        self.assertIs(registries[2], registry)
+
 
 class ManagedSlotFacadeTests(unittest.TestCase):
     def test_create_managed_slot_pins_the_requested_candidate(self):

@@ -264,6 +264,29 @@ class PoolMaintenanceTests(unittest.TestCase):
         self.assertIn("保留现有有效节点", message)
         write.assert_not_called()
 
+    def test_api_failure_recovers_main_connection_from_cached_pool(self):
+        existing = [node(1, "available")]
+        with (
+            mock.patch.object(manager, "active_openvpn_running", return_value=False),
+            mock.patch.object(manager, "read_nodes", return_value=existing),
+            mock.patch.object(
+                manager, "fetch_candidates", side_effect=RuntimeError("API down")
+            ),
+            mock.patch.object(manager.vpn_utils, "check_and_fix_dns"),
+            mock.patch.object(
+                manager.vpn_utils,
+                "diagnose_api_failure",
+                return_value=(1000, "API down"),
+            ),
+            mock.patch.object(manager, "load_ui_config", return_value={"connection_enabled": True, "routing_mode": "auto"}),
+            mock.patch.object(manager, "auto_switch_node") as auto_switch,
+            mock.patch.object(manager, "set_state"),
+        ):
+            message = manager.maintain_valid_nodes()
+
+        self.assertIn("保留现有有效节点", message)
+        auto_switch.assert_called_once_with()
+
 
 class FetchCandidatesTests(unittest.TestCase):
     @staticmethod

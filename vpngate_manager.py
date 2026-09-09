@@ -2279,6 +2279,24 @@ def maintain_valid_nodes(force: bool = False) -> str:
                 err_code, raw_diag = vpn_utils.diagnose_api_failure(API_URL)
                 diag_msg = f"[错误代码 {err_code}] 获取节点失败: {exc} | 诊断结果: {raw_diag}"
             set_state(last_fetch_at=time.time(), last_fetch_status="error", last_fetch_message=diag_msg)
+            # API 暂时不可达时仍要保证主连接自愈。之前的启动阶段会尝试一次
+            # auto_switch_node，但它可能因为候选节点当时尚未写回或连接竞态而
+            # 失败；随后这里直接返回，导致 active_openvpn_node_id 被清空后主
+            # 连接永久停在离线状态，直到下一次 API 成功。使用本地缓存的
+            # probe_status=available 节点再做一次幂等恢复，不依赖官方 API。
+            ui_cfg = load_ui_config()
+            if (
+                ui_cfg.get("connection_enabled", True)
+                and ui_cfg.get("routing_mode", "auto") != "fixed_ip"
+                and not active_openvpn_running()
+            ):
+                is_connecting = False
+                try:
+                    auto_switch_node()
+                except Exception as recover_exc:
+                    print(f"[维护线程] API 失败后的缓存主连接恢复失败: {recover_exc}", flush=True)
+                finally:
+                    is_connecting = True
             return f"获取节点失败，保留现有有效节点 {len(existing_nodes)} 个"
 
         msg = (
@@ -2392,6 +2410,7 @@ exit_slots_lock = threading.RLock()
 exit_slots_supervise_lock = threading.Lock()
 exit_slots: dict[int, dict[str, Any]] = {}
 exit_slot_proxy_stops: dict[int, threading.Event] = {}
+exit_slot_proxy_registries: dict[int, proxy_server.ConnRegistry] = {}
 slot_bad_nodes: dict[str, float] = {}          # node_id -> 冷却到期时间(出口不通的坏节点，暂时排除)
 slot_egress_fail_counts: dict[int, int] = {}   # slot_index -> 连续出口失败次数
 slot_reconnect_hints: dict[int, str] = {}      # 进程重启后优先恢复上次槽位节点；每槽仅消费一次
@@ -2805,10 +2824,12 @@ def ensure_slot_proxy(i: int) -> None:
         if i in exit_slot_proxy_stops:
             return
         stop_ev = threading.Event()
+        registry = proxy_server.ConnRegistry()
         exit_slot_proxy_stops[i] = stop_ev
+        exit_slot_proxy_registries[i] = registry
     threading.Thread(
         target=proxy_server.start_proxy_server,
-        args=(SLOT_PROXY_HOST, slot_port(i), slot_device(i), stop_ev),
+        args=(SLOT_PROXY_HOST, slot_port(i), slot_device(i), stop_ev, registry),
         daemon=True,
     ).start()
 
@@ -2875,6 +2896,11 @@ def tear_down_slot(i: int, stop_proxy: bool = True) -> None:
     with exit_slots_lock:
         slot = exit_slots.pop(i, None)
         stop_ev = exit_slot_proxy_stops.pop(i, None) if stop_proxy else None
+        registry = exit_slot_proxy_registries.pop(i, None) if stop_proxy else exit_slot_proxy_registries.get(i)
+    if registry is not None:
+        closed = registry.close_all()
+        if closed:
+            print(f"[多出口] 槽位 {i} 切换前已重置 {closed} 条下游连接", flush=True)
     if slot and slot.get("process"):
         stop_process(slot["process"])
     cleanup_policy_routing(slot_table(i))
