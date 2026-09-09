@@ -1333,6 +1333,46 @@ def cleanup_policy_routing(table: int = 100) -> None:
     except Exception:
         pass
 
+def policy_routing_ready(interface: str, table: int) -> bool:
+    """确认指定 TUN 仍同时拥有默认路由和按出口接口选表规则。"""
+    if not sys.platform.startswith("linux"):
+        return True
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]+", str(interface or "")) or not 1 <= int(table) <= 2**31 - 1:
+        return False
+    try:
+        routes = subprocess.run(
+            ["ip", "route", "show", "table", str(table)],
+            capture_output=True, text=True, timeout=2,
+        )
+        rules = subprocess.run(
+            ["ip", "rule", "show"],
+            capture_output=True, text=True, timeout=2,
+        )
+    except Exception:
+        return False
+    if routes.returncode != 0 or rules.returncode != 0:
+        return False
+    route_ok = any(
+        line.split()[:1] == ["default"]
+        and any(parts[index:index + 2] == ["dev", interface] for index in range(len(parts) - 1))
+        for line in routes.stdout.splitlines()
+        if (parts := line.split())
+    )
+    rule_ok = any(
+        any(parts[index:index + 2] == ["oif", interface] for index in range(len(parts) - 1))
+        and any(parts[index:index + 2] in (["lookup", str(table)], ["table", str(table)]) for index in range(len(parts) - 1))
+        for line in rules.stdout.splitlines()
+        if (parts := line.replace(":", " ").split())
+    )
+    return route_ok and rule_ok
+
+def ensure_policy_routing(interface: str, table: int) -> bool:
+    """OpenVPN 重连会删除随 TUN 消失的路由；在出口探测前按需重建。"""
+    if policy_routing_ready(interface, table):
+        return True
+    setup_policy_routing(interface, table)
+    return policy_routing_ready(interface, table)
+
 def stop_active_openvpn() -> None:
     global active_openvpn_process, active_openvpn_node_id
     with lock:
@@ -3195,7 +3235,8 @@ def check_managed_slot(i: int) -> dict[str, Any]:
     snapshot = managed_slot_snapshot(i)
     if not snapshot.get("ok"):
         return snapshot
-    ok, exit_ip = check_slot_egress(parse_int(snapshot.get("port")))
+    route_ok = ensure_policy_routing(slot_device(i), slot_table(i))
+    ok, exit_ip = check_slot_egress(parse_int(snapshot.get("port"))) if route_ok else (False, "")
     checked_at = time.time()
     with exit_slots_lock:
         slot = exit_slots.get(i)
@@ -3233,7 +3274,8 @@ def slot_egress_checker_loop() -> None:
             for i in sorted(active):
                 if i in paused or not slot_process_alive(i):
                     continue
-                ok, ip = check_slot_egress(slot_port(i))
+                route_ok = ensure_policy_routing(slot_device(i), slot_table(i))
+                ok, ip = check_slot_egress(slot_port(i)) if route_ok else (False, "")
                 with exit_slots_lock:
                     s = exit_slots.get(i)
                     if s is not None:
@@ -6603,6 +6645,11 @@ def check_proxy_health() -> dict[str, Any]:
         return {
             "ok": False,
             "error": "[错误代码 3004] [ERR_ROUTE_DEV_NOT_FOUND] VPN 虚拟网卡 (tun0) 未启用，请确保当前已成功连接 VPN 节点"
+        }
+    if not ensure_policy_routing("tun0", 100):
+        return {
+            "ok": False,
+            "error": "[错误代码 3003] [ERR_ROUTE_TABLE_ADD_FAILED] VPN 策略路由缺失且自动恢复失败"
         }
 
     # 3. 使用 curl 通过本地 SOCKS5 代理接口测试 IP 与实际延迟

@@ -7,6 +7,37 @@ import vpngate_manager as manager
 
 
 class ExitSlotTypeTests(unittest.TestCase):
+    def test_ensure_policy_routing_repairs_only_when_missing(self):
+        with (
+            mock.patch.object(manager, "policy_routing_ready", side_effect=[True, False, True]) as ready,
+            mock.patch.object(manager, "setup_policy_routing") as setup,
+        ):
+            self.assertTrue(manager.ensure_policy_routing("tun122", 202))
+            setup.assert_not_called()
+            self.assertTrue(manager.ensure_policy_routing("tun122", 202))
+
+        self.assertEqual(ready.call_count, 3)
+        setup.assert_called_once_with("tun122", 202)
+
+    def test_check_managed_slot_repairs_route_before_egress_probe(self):
+        snapshots = [
+            {"ok": True, "port": 17930, "status": "up"},
+            {"ok": True, "port": 17930, "status": "up"},
+        ]
+        runtime = {2: {"slot": 2}}
+        with (
+            mock.patch.object(manager, "managed_slot_snapshot", side_effect=snapshots),
+            mock.patch.object(manager, "ensure_policy_routing", return_value=True) as ensure,
+            mock.patch.object(manager, "check_slot_egress", return_value=(True, "198.51.100.20")) as probe,
+            mock.patch.object(manager, "exit_slots", runtime),
+            mock.patch.object(manager, "write_slots_state"),
+        ):
+            result = manager.check_managed_slot(2)
+
+        ensure.assert_called_once_with("tun122", 202)
+        probe.assert_called_once_with(17930)
+        self.assertTrue(result["egress_ok"])
+
     def test_normalize_proxy_type_maps_only_supported_categories(self):
         cases = {
             "residential": "residential",
